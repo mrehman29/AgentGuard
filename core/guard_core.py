@@ -199,8 +199,7 @@ _RULES = (
             ),
             _sig(r"\brequests\s*\.\s*(?:get|post|put|patch|delete|head|request)\s*\(", "requests"),
             _sig(r"\burlopen\s*\(", "urlopen"),
-            # The name follows the dot directly, so a sentence ending there passes.
-            _sig(r"\burllib\s*\.\s*request\s*\.(?:\\\n[ \t]*)?\w", "urllib"),
+            _sig(r"\burllib\s*\.\s*request\s*\.\s*\w", "urllib"),
             _sig(r"\bsocket\s*\.\s*(?:socket|create_connection)\s*\(", "socket"),
             _sig(r"/dev/tcp/", "/dev/tcp/"),
             _sig(r"\bnc[ \t]+-[a-z]*e\b", "nc"),

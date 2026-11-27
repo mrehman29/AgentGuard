@@ -272,6 +272,14 @@ BLOCKED = {
         "# \\\rimport \\\rsocket",
         "urllib.request.\\\n    urlretrieve(u)",
         "urllib . request .urlretrieve(u)",
+        # Spacing after the module name (review F1).
+        "import urllib.parse\nurllib.request. urlretrieve(u)",
+        "import urllib.parse\nurllib.request . urlretrieve(u)",
+        "import urllib.parse\nurllib.request.\turlretrieve(u)",
+        "import urllib.parse\nurllib.request. \\\nurlretrieve(u)",
+        "import urllib.parse\nurllib.request.\\\n\\\nurlretrieve(u)",
+        "import urllib.parse\n(urllib.request.\n urlretrieve)(u, p)",
+        "import urllib.parse\nurllib.request. build_opener().open(u)",
         "/bin/rm -rf /",
         "x.rm -rf /",
         "import urllib.parse\nurllib.request.urlretrieve(u)",
@@ -340,8 +348,6 @@ BENIGN = [
     "from urllib.parse import urlencode",
     "from urllib import parse",
     "Explain urllib.request.",
-    "Explain urllib.request. Then give an example.",
-    "I studied urllib.request.\nNext topic",
     # Listed in review D1, but a method definition is exempt (A5) however it is read.
     "# \\\ndef eval(x)",
     "import urllib.parse",
