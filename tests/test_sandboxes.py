@@ -1,5 +1,6 @@
 """Sandbox tests (Track B). Docker tests are skipped without a daemon and image."""
 
+import ast
 import asyncio
 import base64
 import errno
@@ -875,3 +876,20 @@ async def test_serve_turns_proxy_headers_off(monkeypatch):
     monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: calls.append(kwargs))
     worker.serve()
     assert calls[0]["proxy_headers"] is False and calls[0]["host"] == "0.0.0.0"
+
+
+@needs_docker
+async def test_docker_proxy_settings_do_not_reach_the_code(containers, monkeypatch, tmp_path):
+    proxy = "http://user:CANARY@proxy.invalid:3128"
+    keys = ("httpProxy", "httpsProxy", "ftpProxy", "noProxy", "allProxy")
+    config = {"proxies": {"default": dict.fromkeys(keys, proxy)}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    result = await docker_run(
+        "import os; print({k: v for k, v in os.environ.items() if 'proxy' in k.lower()})"
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "CANARY" not in result.stdout
+    names = [f"{kind}_proxy" for kind in ("http", "https", "ftp", "no", "all")]
+    expected = dict.fromkeys(names + [name.upper() for name in names], "")
+    assert ast.literal_eval(result.stdout) == expected

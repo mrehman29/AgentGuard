@@ -39,6 +39,15 @@ ISOLATION_FLAGS = (
     "--log-driver", "none",  # output is not also written to the host disk
 )
 
+# The docker client copies proxy settings, passwords included, from its config
+# into containers. Setting each variable to empty overrides that.
+BLANK_PROXY_FLAGS = tuple(
+    flag
+    for kind in ("HTTP", "HTTPS", "FTP", "NO", "ALL")
+    for name in (f"{kind}_PROXY", f"{kind.lower()}_proxy")
+    for flag in ("--env", f"{name}=")
+)
+
 
 class _Capture:
     """Keeps the first bytes of a stream and discards the rest."""
@@ -131,6 +140,7 @@ class DockerSandboxProvider(SandboxProvider):
                 process = await asyncio.create_subprocess_exec(
                     "docker", "run", "--rm", "--name", name, "--cidfile", str(cidfile),
                     *ISOLATION_FLAGS,
+                    *BLANK_PROXY_FLAGS,
                     "-i", image,
                     "timeout", "--signal=KILL", str(request.timeout_sec + BACKSTOP_GRACE_SEC),
                     "python3", "-I", "-u", "-",
