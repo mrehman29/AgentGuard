@@ -294,3 +294,16 @@ def test_zero_that_disables_the_breaker_is_rejected(monkeypatch, name):
 def test_zero_cap_is_allowed(monkeypatch):
     monkeypatch.setenv("SESSION_BUDGET_CAP_GBP", "0")
     assert get_settings().session_budget_cap_gbp == 0
+
+
+@pytest.mark.parametrize("tool_name", [None, "\ud800"])
+async def test_unusable_tool_name_blocks_and_serialises(env, tool_name):
+    result = await pipeline.execute_guarded("i", tool_name, {"code": "1"}, "demo")
+    assert result.guard.decision is Decision.BLOCK
+    assert env.provider.requests == [] and env.calls == []
+    result.model_dump_json()
+
+
+def test_preset_is_a_config_id():
+    event = RunEvent(type="run_started", run_id="r", session_id="demo", preset="safe", total_steps=1)
+    assert json.loads(event.to_ndjson())["preset"] == "safe"

@@ -67,13 +67,14 @@ def _unavailable_budget(session_id: str) -> BudgetStatus:
     )
 
 
-def _check_caller_values(intent: str, session_id: str, args: dict) -> None:
+def _check_caller_values(intent: str, tool_name: str, session_id: str, args: dict) -> None:
     """Reject values that could not be put in the result or serialised."""
-    if not isinstance(intent, str) or not isinstance(session_id, str):
-        raise TypeError("intent and session_id must be text")
+    if not all(isinstance(value, str) for value in (intent, tool_name, session_id)):
+        raise TypeError("intent, tool_name and session_id must be text")
     if not isinstance(args, dict) or not all(isinstance(key, str) for key in args):
         raise TypeError("tool arguments must be an object")
-    json.dumps([intent, session_id, args], ensure_ascii=False, allow_nan=False).encode()
+    values = [intent, tool_name, session_id, args]
+    json.dumps(values, ensure_ascii=False, allow_nan=False).encode()
 
 
 def _safe_text(value: object) -> str:
@@ -112,7 +113,7 @@ async def execute_guarded(
 
     try:
         # Snapshot first: what is evaluated is exactly what runs.
-        _check_caller_values(intent, session_id, args)
+        _check_caller_values(intent, tool_name, session_id, args)
         tool_args = copy.deepcopy(args)
         request = _sandbox_request(tool_name, tool_args)
         sandbox_provider = get_sandbox_provider(provider)
@@ -148,7 +149,8 @@ async def execute_guarded(
             logger.exception("guard evaluation failed")
             guard = error_block("Guard error: evaluation failed.", latency_ms=_elapsed_ms(start))
 
-    intent, session_id = _safe_text(intent), _safe_text(session_id)
+    intent, tool_name = _safe_text(intent), _safe_text(tool_name)
+    session_id = _safe_text(session_id)
     try:
         json.dumps(tool_args, ensure_ascii=False, allow_nan=False).encode()
     except (TypeError, ValueError):

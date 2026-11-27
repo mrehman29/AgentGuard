@@ -153,7 +153,7 @@ class RunEvent(Frozen):
     type: RunEventType
     run_id: str
     session_id: str | None = None
-    preset: int | None = None
+    preset: str | None = None  # a preset id from /api/config
     total_steps: int | None = None
     index: int | None = None
     intent: str | None = None
