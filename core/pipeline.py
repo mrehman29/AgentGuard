@@ -3,7 +3,9 @@
 Only ALLOW executes. Every guard error ends in BLOCK. Frozen after Phase 0.
 """
 
+import asyncio
 import copy
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -65,6 +67,32 @@ def _unavailable_budget(session_id: str) -> BudgetStatus:
     )
 
 
+def _check_caller_values(intent: str, session_id: str, args: dict) -> None:
+    """Reject values that could not be put in the result or serialised."""
+    if not isinstance(intent, str) or not isinstance(session_id, str):
+        raise TypeError("intent and session_id must be text")
+    if not isinstance(args, dict) or not all(isinstance(key, str) for key in args):
+        raise TypeError("tool arguments must be an object")
+    json.dumps([intent, session_id, args], ensure_ascii=False, allow_nan=False).encode()
+
+
+def _safe_text(value: object) -> str:
+    return str(value).encode("utf-8", "replace").decode()
+
+
+def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
+    budget_store.get_tracker().record(
+        LedgerEntry(
+            time=datetime.now(UTC),
+            source=source,
+            session_id=session_id,
+            label=label,
+            outcome=ledger_outcome(guard),
+            cost_gbp=guard.cost_gbp,
+        )
+    )
+
+
 async def execute_guarded(
     intent: str,
     tool_name: str,
@@ -84,13 +112,16 @@ async def execute_guarded(
 
     try:
         # Snapshot first: what is evaluated is exactly what runs.
-        if not isinstance(args, dict):
-            raise TypeError("tool arguments must be an object")
+        _check_caller_values(intent, session_id, args)
         tool_args = copy.deepcopy(args)
         request = _sandbox_request(tool_name, tool_args)
         sandbox_provider = get_sandbox_provider(provider)
     except (ValidationError, ValueError, TypeError) as exc:
-        reason = "Invalid arguments." if isinstance(exc, ValidationError) else f"Invalid request: {exc}."
+        # UnicodeError and ValidationError are ValueErrors with unsafe messages.
+        if isinstance(exc, (ValidationError, UnicodeError)):
+            reason = "Invalid arguments."
+        else:
+            reason = _safe_text(f"Invalid request: {exc}.")
         guard = error_block(reason, latency_ms=_elapsed_ms(start))
     except Exception:
         logger.exception("request setup failed")
@@ -106,31 +137,41 @@ async def execute_guarded(
                 on_event=on_event,
                 record=False,
             )
+        except asyncio.CancelledError:
+            cancelled = error_block("Guard error: cancelled.", latency_ms=_elapsed_ms(start))
+            try:
+                _record(session_id, source, label, cancelled)
+            except Exception:
+                logger.exception("ledger update failed")
+            raise
         except Exception:
             logger.exception("guard evaluation failed")
             guard = error_block("Guard error: evaluation failed.", latency_ms=_elapsed_ms(start))
 
+    intent, session_id = _safe_text(intent), _safe_text(session_id)
     try:
-        tracker = budget_store.get_tracker()
-        tracker.record(
-            LedgerEntry(
-                time=datetime.now(UTC),
-                source=source,
-                session_id=session_id,
-                label=label,
-                outcome=ledger_outcome(guard),
-                cost_gbp=guard.cost_gbp,
-            )
-        )
-        tracker.check_budget(session_id)
-    except Exception:
+        json.dumps(tool_args, ensure_ascii=False, allow_nan=False).encode()
+    except (TypeError, ValueError):
+        tool_args = {}
+
+    # Read first, then record once, so the entry always matches the verdict.
+    def ledger_error(previous: GuardEvaluation) -> GuardEvaluation:
         logger.exception("ledger update failed")
-        guard = error_block(
+        return error_block(
             "Guard error: ledger unavailable.",
-            gates_passed=list(guard.gates_passed),
-            latency_ms=guard.latency_ms,
-            cost_gbp=guard.cost_gbp,
+            gates_passed=list(previous.gates_passed),
+            latency_ms=previous.latency_ms,
+            cost_gbp=previous.cost_gbp,
         )
+
+    try:
+        budget_store.get_tracker().check_budget(session_id)
+    except Exception:
+        guard = ledger_error(guard)
+    try:
+        _record(session_id, source, label, guard)
+    except Exception:
+        guard = ledger_error(guard)
 
     result = None
     if guard.decision is Decision.ALLOW and request is not None and sandbox_provider is not None:

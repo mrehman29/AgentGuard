@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MAX_CODE_CHARS = 20_000
+# Providers truncate output at 16 KB of bytes; this character limit is a backstop.
 MAX_OUTPUT_CHARS = 16 * 1024
 EXECUTABLE_TOOL = "execute_python"
 
@@ -145,8 +146,8 @@ RUN_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
 class RunEvent(Frozen):
     """One NDJSON line from POST /api/run.
 
-    Serialise with model_dump_json(exclude_unset=True). `preset` and
-    `total_steps` may be null but must be passed for run_started.
+    Serialise with to_ndjson(). `preset` and `total_steps` may be null but
+    must be passed for run_started.
     """
 
     type: RunEventType
@@ -175,6 +176,10 @@ class RunEvent(Frozen):
         if missing:
             raise ValueError(f"{self.type} event is missing: {', '.join(missing)}")
         return self
+
+    def to_ndjson(self) -> str:
+        """Only the fields passed to this event; nested models in full."""
+        return self.model_dump_json(include=self.model_fields_set) + "\n"
 
 
 def ledger_outcome(guard: GuardEvaluation) -> Outcome:

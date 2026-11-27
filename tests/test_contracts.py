@@ -1,6 +1,9 @@
 """Contract tests. They replace the guard, ledger and sandbox, so they stay
 valid when the tracks swap the stubs for real code."""
 
+import asyncio
+import inspect
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,7 @@ from core.schemas import (
     Decision,
     GuardEvaluation,
     OwaspTag,
+    PipelineStepResult,
     RunEvent,
     SandboxRequest,
     SandboxResult,
@@ -161,6 +165,7 @@ async def test_ledger_failure_blocks(env, tracker):
     assert result.guard.decision is Decision.BLOCK
     assert result.guard.cost_gbp == 0.001
     assert env.provider.requests == []
+    assert [e.outcome for e in env.tracker.entries] == ([] if tracker.fail_record else ["BLOCK error"])
 
 
 async def test_sandbox_exception_reports_exit_125(env):
@@ -217,3 +222,75 @@ def test_token_cost(monkeypatch):
     for name, value in {"INPUT_COST_PER_1M_USD": "0.30", "OUTPUT_COST_PER_1M_USD": "2.50", "USD_TO_GBP": "0.80"}.items():
         monkeypatch.setenv(name, value)
     assert token_cost_gbp(get_settings(), 1_000_000, 1_000_000) == pytest.approx(2.24)
+
+
+async def test_cancellation_is_recorded_and_propagates(env):
+    env.guard_error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await run()
+    assert [e.outcome for e in env.tracker.entries] == ["BLOCK error"]
+    assert env.provider.requests == []
+
+
+@pytest.mark.parametrize(
+    "intent,args",
+    [(None, {"code": "1"}), ("i", {1: "x"}), ("i", {"code": "\ud800"}), ("\ud800", {"code": "1"})],
+)
+async def test_unusable_caller_values_block_and_serialise(env, intent, args):
+    result = await pipeline.execute_guarded(intent, "execute_python", args, "demo")
+    assert result.guard.decision is Decision.BLOCK
+    assert env.provider.requests == [] and env.calls == []
+    result.model_dump_json()
+
+
+async def test_ndjson_keeps_nested_defaults(env):
+    env.guard = GuardEvaluation(
+        decision=Decision.BLOCK, risk_score=100, owasp_tag=OwaspTag.NA, reason="r",
+        stage=Stage.BUDGET, latency_ms=0,
+    )
+    result = await run()
+    line = RunEvent(type="step_finished", run_id="r", index=1, result=result).to_ndjson()
+    data = json.loads(line)
+    assert line.endswith("\n") and "message" not in data
+    assert data["result"]["guard"]["cost_gbp"] == 0
+    assert data["result"]["guard"]["gates_passed"] == []
+
+
+async def test_source_and_events_pass_through(env):
+    callback = lambda *_: None  # noqa: E731
+    await run(source="mcp", label="execute", on_event=callback)
+    assert env.calls[0][2] == {"source": "mcp", "label": "execute", "on_event": callback, "record": False}
+    assert env.tracker.entries[0].source == "mcp"
+
+
+@pytest.mark.parametrize(
+    "function,parameters",
+    [
+        (guard_core.fast_rule_check, "tool_name args"),
+        (guard_core.evaluate_owasp_policy, "tool_name args session_id"),
+        (guard_core.evaluate_action, "tool_name args session_id source label on_event record"),
+        (pipeline.execute_guarded, "intent tool_name args session_id provider source label on_event"),
+        (budget_store.SessionBudgetTracker.reserve, "self session_id estimate_gbp"),
+        (budget_store.SessionBudgetTracker.commit, "self reservation_id usage"),
+        (budget_store.SessionBudgetTracker.set_session_cap, "self session_id cap_gbp"),
+        (budget_store.SessionBudgetTracker.recent_entries, "self limit"),
+    ],
+)
+def test_frozen_signatures(function, parameters):
+    assert list(inspect.signature(function).parameters) == parameters.split()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["USD_TO_GBP", "INPUT_COST_PER_1M_USD", "OUTPUT_COST_PER_1M_USD",
+     "BUDGET_RESERVE_INPUT_TOKENS", "BUDGET_RESERVE_OUTPUT_TOKENS", "CLASSIFIER_TIMEOUT_SEC"],
+)
+def test_zero_that_disables_the_breaker_is_rejected(monkeypatch, name):
+    monkeypatch.setenv(name, "0")
+    with pytest.raises(ConfigError):
+        get_settings()
+
+
+def test_zero_cap_is_allowed(monkeypatch):
+    monkeypatch.setenv("SESSION_BUDGET_CAP_GBP", "0")
+    assert get_settings().session_budget_cap_gbp == 0
