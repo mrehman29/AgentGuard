@@ -294,7 +294,11 @@ def test_budget_endpoints(client_env):
         assert res.status_code == 200
         assert res.json()["session_id"] == "demo"
 
-        reset_res = client.post("/api/budget/demo/reset")
+        # Reset without X-Requested-With header is rejected with 403
+        bad_reset = client.post("/api/budget/demo/reset")
+        assert bad_reset.status_code == 403
+
+        reset_res = client.post("/api/budget/demo/reset", headers={"X-Requested-With": "AgentGuard"})
         assert reset_res.status_code == 200
         assert reset_res.json()["session_id"] == "demo"
         assert any(e.label == "reset" and e.outcome == "OK" for e in client_env.entries)
@@ -333,14 +337,14 @@ def test_origin_header_validation(client_env):
         # Evil origin on POST is rejected with 403 (C-02, C-13)
         res = client.post(
             "/api/budget/demo/reset",
-            headers={"origin": "http://evil.example"},
+            headers={"origin": "http://evil.example", "X-Requested-With": "AgentGuard"},
         )
         assert res.status_code == 403
 
         # Legitimate origin is accepted
         good_res = client.post(
             "/api/budget/demo/reset",
-            headers={"origin": "http://127.0.0.1:8765"},
+            headers={"origin": "http://127.0.0.1:8765", "X-Requested-With": "AgentGuard"},
         )
         assert good_res.status_code == 200
 
@@ -863,14 +867,14 @@ def test_budget_endpoints_invalid_session_ids(client_env):
         res_get2 = client.get("/api/budget/a%0Atest")
         assert res_get2.status_code == 422
 
-        res_reset = client.post("/api/budget/a%0Atest/reset")
+        res_reset = client.post("/api/budget/a%0Atest/reset", headers={"X-Requested-With": "AgentGuard"})
         assert res_reset.status_code == 422
 
         # Trailing newline session_id (demo\n)
         res_get3 = client.get("/api/budget/demo%0A")
         assert res_get3.status_code == 422
 
-        res_reset2 = client.post("/api/budget/demo%0A/reset")
+        res_reset2 = client.post("/api/budget/demo%0A/reset", headers={"X-Requested-With": "AgentGuard"})
         assert res_reset2.status_code == 422
 
         # 64 chars + \n (65 chars total)
@@ -878,7 +882,7 @@ def test_budget_endpoints_invalid_session_ids(client_env):
         res_get4 = client.get(f"/api/budget/{long_trail}")
         assert res_get4.status_code == 422
 
-        res_reset3 = client.post(f"/api/budget/{long_trail}/reset")
+        res_reset3 = client.post(f"/api/budget/{long_trail}/reset", headers={"X-Requested-With": "AgentGuard"})
         assert res_reset3.status_code == 422
 
         # Ensure raw newline was never written to ledger
@@ -952,3 +956,68 @@ async def test_mcp_invalid_args_with_valid_session_id_records_caller_session(cli
                         e.source == "mcp" and e.session_id == "caller_exec_session" and e.label == "execute" and e.outcome == "BLOCK error"
                         for e in client_env.entries
                     )
+
+
+# 1. MCP server tracker failure handling
+async def test_mcp_tracker_failure_returns_sanitized_block(monkeypatch):
+    import httpx
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    def broken_get_tracker():
+        raise RuntimeError("database locked")
+
+    monkeypatch.setattr(budget_store, "get_tracker", broken_get_tracker)
+
+    async with lifespan(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1", follow_redirects=True) as http_client:
+            async with streamable_http_client("http://127.0.0.1/mcp", http_client=http_client) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+
+                    # guard_check_action with valid arguments
+                    res_valid = await session.call_tool(
+                        "guard_check_action",
+                        {"tool_name": "execute_python", "args_json": '{"code": "print(1)"}', "session_id": "test_s"},
+                    )
+                    assert res_valid.structuredContent["decision"] == "BLOCK"
+                    assert res_valid.structuredContent["reason"] == "Guard error. Failing closed."
+
+                    # guard_check_action with invalid arguments
+                    res_inv = await session.call_tool(
+                        "guard_check_action",
+                        {"tool_name": "execute_python", "args_json": "invalid-json", "session_id": "test_s"},
+                    )
+                    assert res_inv.structuredContent["decision"] == "BLOCK"
+                    assert res_inv.structuredContent["reason"] == "Guard error. Failing closed."
+
+                    # guard_execute_sandbox with valid code -> returns BLOCK and runs nothing
+                    res_exec_valid = await session.call_tool(
+                        "guard_execute_sandbox",
+                        {"code": "print(1)", "session_id": "test_s"},
+                    )
+                    assert res_exec_valid.structuredContent["decision"] == "BLOCK"
+                    assert res_exec_valid.structuredContent["reason"] == "Guard error. Failing closed."
+
+                    # guard_execute_sandbox with invalid arguments
+                    res_exec_inv = await session.call_tool(
+                        "guard_execute_sandbox",
+                        {"code": "print(1)", "session_id": "bad\n", "provider": "x" * 100},
+                    )
+                    assert res_exec_inv.structuredContent["decision"] == "BLOCK"
+                    assert res_exec_inv.structuredContent["reason"] == "Guard error. Failing closed."
+
+                    # guard_get_budget_status with valid session
+                    res_budget_valid = await session.call_tool(
+                        "guard_get_budget_status",
+                        {"session_id": "test_s"},
+                    )
+                    assert res_budget_valid.structuredContent.get("error") == "Guard error. Failing closed."
+
+                    # guard_get_budget_status with invalid session
+                    res_budget_inv = await session.call_tool(
+                        "guard_get_budget_status",
+                        {"session_id": "bad\n"},
+                    )
+                    assert "error" in res_budget_inv.structuredContent

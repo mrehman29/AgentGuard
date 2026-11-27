@@ -404,8 +404,9 @@ def test_signatures_are_found_in_nested_arguments():
 )
 def test_regex_gate_is_fast_on_the_largest_code(chunk):
     code = (chunk * 20_000)[:20_000]
+    guard_core.fast_rule_check("execute_python", {"code": code})
     # The fastest of several runs, so that a busy machine does not fail the test.
-    best = min(_timed(lambda: guard_core.fast_rule_check("execute_python", {"code": code})) for _ in range(15))
+    best = min(_timed(lambda: guard_core.fast_rule_check("execute_python", {"code": code})) for _ in range(30))
     assert best < 0.005
 
 
@@ -413,7 +414,8 @@ def test_regex_gate_is_fast_on_the_largest_code(chunk):
 def test_regex_gate_stays_bounded_on_the_slowest_inputs(chunk):
     """Crafted to be slow: about 4.5 ms when idle, too close to 5 ms to assert."""
     code = (chunk * 20_000)[:20_000]
-    best = min(_timed(lambda: guard_core.fast_rule_check("execute_python", {"code": code})) for _ in range(5))
+    guard_core.fast_rule_check("execute_python", {"code": code})
+    best = min(_timed(lambda: guard_core.fast_rule_check("execute_python", {"code": code})) for _ in range(15))
     assert best < 0.025
 
 

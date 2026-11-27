@@ -363,7 +363,7 @@ function showSandbox(sandbox) {
   if (failed) {
     let headline = `FAILED: exit code ${sandbox.exit_code}`;
     if (sandbox.timed_out) {
-      headline = `TIMED OUT after ${Math.round(sandbox.duration_ms / 1000)} s`;
+      headline = 'TIMED OUT';
     } else if (sandbox.exit_code === 125) {
       headline = 'SANDBOX OFFLINE: NOTHING RAN';
     }

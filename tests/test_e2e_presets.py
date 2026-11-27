@@ -282,7 +282,14 @@ def env(monkeypatch, tmp_path, model, worker_url):
             check=True,
             timeout=10,
         ).stdout.split()
-        assert not set(started()) & set(listed), "containers were left behind"
+        leftover = list(set(started()) & set(listed))
+        if leftover:
+            subprocess.run(
+                ["docker", "rm", "-f", *leftover],
+                capture_output=True,
+                check=False,
+            )
+        assert not leftover, "containers were left behind"
 
 
 @contextmanager
@@ -673,13 +680,13 @@ def test_reset_clears_only_the_active_session(web, model):
     spent_everywhere = budget(web, loop)["global_spent_gbp"]
     assert spent_everywhere > demo["spent_gbp"] > 0
 
-    cleared = web.post(f"/api/budget/{loop}/reset").json()
+    cleared = web.post(f"/api/budget/{loop}/reset", headers={"X-Requested-With": "AgentGuard"}).json()
     assert (cleared["spent_gbp"], cleared["total_tokens"], cleared["reserved_gbp"]) == (0, 0, 0)
     assert cleared["cap_gbp"] == SESSION_CAP_GBP  # the preset cap is gone
     assert cleared["global_spent_gbp"] == pytest.approx(spent_everywhere)
     assert budget(web, "demo") == demo | {"global_spent_gbp": cleared["global_spent_gbp"]}
 
-    cleared = web.post("/api/budget/demo/reset").json()
+    cleared = web.post("/api/budget/demo/reset", headers={"X-Requested-With": "AgentGuard"}).json()
     assert (cleared["spent_gbp"], cleared["total_tokens"]) == (0, 0)
     assert cleared["global_spent_gbp"] == pytest.approx(spent_everywhere)
     assert cleared == budget(web, "demo")
@@ -696,7 +703,7 @@ def test_all_presets_then_reset_recovers_from_an_exhausted_session(web, model):
     [refused] = results(run(web, budget_cap_gbp=0.0001, **body))
     assert (refused["guard"]["stage"], refused["guard"]["gates_passed"]) == ("BUDGET", ["REGEX"])
     assert model.calls == 0
-    assert web.post("/api/budget/demo/reset").json()["cap_gbp"] == SESSION_CAP_GBP
+    assert web.post("/api/budget/demo/reset", headers={"X-Requested-With": "AgentGuard"}).json()["cap_gbp"] == SESSION_CAP_GBP
     for preset_id, decisions in (
         ("safe", ["ALLOW", "ALLOW"]),
         ("injection", ["BLOCK"]),
@@ -757,7 +764,7 @@ async def test_stdio_activity_appears_in_the_web_ledger_and_budget(web, env, tmp
         ]
         assert sum(e["cost_gbp"] for e in entries) == pytest.approx(seen_by_web["spent_gbp"])
 
-        web.post("/api/budget/shared/reset")
+        web.post("/api/budget/shared/reset", headers={"X-Requested-With": "AgentGuard"})
         after = await tool(session, "guard_get_budget_status", session_id="shared")
         assert after["spent_gbp"] == 0
         assert after["global_spent_gbp"] == pytest.approx(5 * unit_cost())
