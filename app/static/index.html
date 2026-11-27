@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentGuard · Red-Team Console</title>
+  <link rel="stylesheet" href="/static/fonts.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/console.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <h1>AgentGuard</h1>
+        <p class="subtitle">Agent firewall · cost circuit breaker</p>
+      </div>
+
+      <div id="provider-pill" class="pill" role="group" aria-label="Sandbox provider"></div>
+
+      <div id="meter" class="meter">
+        <p id="meter-text" class="meter-text">demo · loading budget…</p>
+        <div class="meter-track"><div id="meter-bar" class="meter-bar"></div></div>
+        <p id="meter-global" class="meter-global">Global —</p>
+      </div>
+
+      <button id="btn-reset" class="btn btn-secondary" type="button">Reset session</button>
+    </header>
+
+    <main class="body">
+      <section class="left" aria-label="Agent and presets">
+        <label class="caps" for="prompt-input">PROMPT</label>
+        <textarea id="prompt-input" class="prompt" maxlength="20000" spellcheck="false"
+                  placeholder="Choose a preset or type a prompt…"></textarea>
+        <button id="btn-run" class="btn btn-primary btn-run" type="button" disabled>Run through AgentGuard</button>
+        <h2 class="caps">DEMO PRESETS</h2>
+        <div id="presets" class="presets">
+          <p id="presets-loading" class="presets-loading">Loading presets…</p>
+        </div>
+        <div class="ledger">
+          <h2 class="caps">LEDGER · ALL SESSIONS · newest last</h2>
+          <div id="ledger-rows" class="ledger-rows" tabindex="0">No activity yet.</div>
+        </div>
+      </section>
+
+      <section class="right" aria-label="Telemetry">
+        <article id="card-1" class="card">
+          <div class="card-head">
+            <h2 class="caps">1 · AGENT INTENT</h2>
+            <span id="c1-session" class="card-note">session demo</span>
+          </div>
+          <div class="card-body">
+            <div class="metric metric-tool">
+              <span class="metric-label">Tool</span>
+              <span id="c1-tool" class="metric-value">—</span>
+            </div>
+            <p id="c1-intent" class="intent">No request yet.</p>
+            <div class="output code-block">
+              <span id="c1-label" class="output-label">Arguments</span>
+              <pre id="c1-code" class="output-text" tabindex="0">–</pre>
+            </div>
+          </div>
+        </article>
+
+        <article id="card-2" class="card">
+          <div class="card-head">
+            <h2 class="caps">2 · GATE VERDICT</h2>
+            <span class="card-note">only ALLOW executes</span>
+          </div>
+          <div class="card-body scroll" aria-live="polite">
+            <div id="c2-badge" class="verdict" data-verdict="idle">
+              <img id="c2-icon" src="/static/icons/verdict-idle.svg" alt="">
+              <span id="c2-word">NO REQUEST</span>
+            </div>
+            <p id="c2-tag" class="tag">No verdict yet</p>
+            <p id="c2-risk" class="risk">Waiting for a request</p>
+            <ul class="chips">
+              <li id="chip-budget" class="chip" data-state="waiting"><img src="/static/icons/chip-waiting.svg" alt=""><span>Budget</span></li>
+              <li id="chip-regex" class="chip" data-state="waiting"><img src="/static/icons/chip-waiting.svg" alt=""><span>Regex</span></li>
+              <li id="chip-owasp" class="chip" data-state="waiting"><img src="/static/icons/chip-waiting.svg" alt=""><span>OWASP</span></li>
+              <li id="chip-sandbox" class="chip" data-state="waiting"><img src="/static/icons/chip-waiting.svg" alt=""><span>Sandbox</span></li>
+            </ul>
+            <p id="c2-reason" class="reason">Every action passes Budget, Regex and OWASP gates before it can execute.</p>
+          </div>
+        </article>
+
+        <article id="card-3" class="card">
+          <div class="card-head">
+            <h2 class="caps">3 · SANDBOX EXECUTION</h2>
+            <span id="c3-provider" class="card-note">docker</span>
+          </div>
+          <div class="card-body scroll">
+            <p id="c3-headline" class="headline" hidden></p>
+            <div class="metrics">
+              <div class="metric"><span class="metric-label">Exit code</span><span id="c3-exit" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Duration</span><span id="c3-duration" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Timed out</span><span id="c3-timeout" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Truncated</span><span id="c3-truncated" class="metric-value">—</span></div>
+            </div>
+            <div id="c3-stdout-box" class="output stdout">
+              <span id="c3-stdout-label" class="output-label">stdout</span>
+              <pre id="c3-stdout" class="output-text" tabindex="0">No output yet.</pre>
+            </div>
+            <p id="c3-lines" class="lines-note" hidden></p>
+            <div id="c3-stderr-box" class="output stderr" hidden>
+              <span id="c3-stderr-label" class="output-label">stderr</span>
+              <pre id="c3-stderr" class="output-text" tabindex="0"></pre>
+            </div>
+          </div>
+        </article>
+
+        <article id="card-4" class="card">
+          <div class="card-head">
+            <h2 class="caps">4 · SESSION TOKEN P&amp;L</h2>
+            <span id="c4-session" class="card-note">session demo</span>
+          </div>
+          <div class="card-body scroll">
+            <div class="money">
+              <div class="metric"><span class="metric-label">Spent</span><span id="c4-spent" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Reserved</span><span id="c4-reserved" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Remaining</span><span id="c4-remaining" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Session cap</span><span id="c4-cap" class="metric-value">—</span></div>
+            </div>
+            <div class="metrics tokens">
+              <div class="metric"><span class="metric-label">Prompt</span><span id="c4-prompt" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Candidates</span><span id="c4-candidates" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Thoughts</span><span id="c4-thoughts" class="metric-value">—</span></div>
+              <div class="metric"><span class="metric-label">Total tokens</span><span id="c4-total" class="metric-value">—</span></div>
+            </div>
+            <p id="c4-global" class="global-line">Global — · all sessions</p>
+            <p id="c4-note" class="budget-note">Loading budget…</p>
+          </div>
+        </article>
+
+        <div class="mcp">
+          <div class="mcp-head">
+            <div>
+              <h2 class="caps">CONNECT YOUR AGENT (MCP)</h2>
+              <p class="mcp-short">stdio, or HTTP at <span class="mcp-url"></span></p>
+            </div>
+            <button id="btn-show-config" class="btn btn-secondary compact-only" type="button"
+                    aria-expanded="false" aria-controls="mcp-overlay" disabled>Show config</button>
+            <button class="btn btn-secondary btn-copy" type="button" disabled>Copy config</button>
+          </div>
+          <pre class="mcp-json wide-only" tabindex="0">Loading configuration…</pre>
+          <p class="mcp-foot wide-only">Same policy and budget over stdio, or Streamable HTTP at <span class="mcp-url"></span></p>
+        </div>
+
+        <div id="mcp-overlay" class="mcp mcp-overlay" role="dialog" aria-label="MCP client configuration" hidden>
+          <div class="mcp-head">
+            <h2 class="caps">CONNECT YOUR AGENT (MCP)</h2>
+            <button id="btn-hide-config" class="btn btn-secondary" type="button">Hide config (Esc)</button>
+            <button class="btn btn-secondary btn-copy" type="button" disabled>Copy config</button>
+          </div>
+          <pre class="mcp-json" tabindex="0">Loading configuration…</pre>
+          <p class="mcp-foot">Same policy and budget over stdio, or Streamable HTTP at <span class="mcp-url"></span></p>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
