@@ -1,7 +1,7 @@
 # AgentGuard
 AgentGuard — A dual-interface AI agent firewall and cost circuit breaker. Combines deterministic regex filtering, Gemini Structured Outputs OWASP classification, real-time token P&amp;L caps, and isolated Cloud Run code execution—accessible via a standalone web console or drop-in MCP server.
 
-> **Status (buildathon build):** code runs in the Docker sandbox. The Cloud Run provider is written but **not deployed**, and the Gemini classifier has **not yet been verified against the live API**. Read [Known limits](#known-limits) before relying on any of it.
+> **Status (buildathon build):** the Gemini classifier has been checked against the live API on a [small sample](#live-measurements), and code runs in the Docker sandbox. The Cloud Run provider is written but **not deployed**. Read [Known limits](#known-limits) before relying on any of it.
 
 ## What it is
 
@@ -40,7 +40,7 @@ Request (web console or MCP client)
 
 ## Setup
 
-You need Linux, `git`, [uv](https://docs.astral.sh/uv/), a running Docker daemon your user can access, and a Gemini API key for any `ALLOW` verdict.
+You need Linux, `git`, [uv](https://docs.astral.sh/uv/), a running Docker daemon your user can access, and a Gemini API key for any `ALLOW` verdict (preferably [billing-enabled](#rate-limits)).
 
 ```bash
 git clone https://github.com/mrehman29/AgentGuard.git
@@ -137,7 +137,7 @@ Settings come from `.env` in the project root; real environment variables overri
 | `CLASSIFIER_TIMEOUT_SEC` | `5` | Time limit for the classifier and the demo agent model calls. |
 | `BUDGET_RESERVE_INPUT_TOKENS` | `610` | Input tokens assumed when reserving cost. |
 | `BUDGET_RESERVE_OUTPUT_TOKENS` | `512` | Output tokens reserved, and the model's output limit. |
-| `PRESET3_SESSION_CAP_GBP` | `0.002` | Session cap for the runaway loop preset. Not yet tuned on real calls. |
+| `PRESET3_SESSION_CAP_GBP` | `0.0017` | Session cap for the runaway loop preset. An older `.env` may still set `0.002`. |
 | `PRESET3_MAX_STEPS` | `6` | Most steps the loop preset attempts. |
 
 Rates, timeouts and reserve sizes must be above zero; a cap may be zero. Restart the server after changing `.env`.
@@ -148,7 +148,9 @@ Rates, timeouts and reserve sizes must be above zero; a cap may be zero. Restart
 .venv/bin/pytest
 ```
 
-The tests need no API key and use fake model responses. Docker tests are skipped when there is no daemon or no sandbox image, so build the image first and check the summary for skips (`.venv/bin/pytest -rs` lists the reasons). One test uses the project's ledger and adds a zero-cost MCP entry to `data/guard_state.db`, which then shows in the console.
+The suite has 448 tests, including integration and end-to-end tests of the presets, both sandbox providers and the shared ledger. It needs no API key: model responses are faked, and the Cloud Run provider is tested against a local worker, not a deployed service. It uses temporary databases and does not write `data/guard_state.db`.
+
+Docker tests are skipped without a daemon or sandbox image (without a daemon: 418 passed, 30 skipped). Build `agentguard-sandbox:latest` first, as the end-to-end tests look for that tag, and check the summary for skips (`.venv/bin/pytest -rs` lists the reasons).
 
 ## Demo
 
@@ -158,11 +160,30 @@ Build the image, set a working API key, start the console and wait for the provi
 |---|---|---|---|
 | 1 Safe data query | Prompt is screened, the agent proposes Python, the code is screened and run | `ALLOW`, sandbox output, spend recorded | Yes |
 | 2 Prompt injection | The prompt hits a signature rule | `BLOCK` at the regex gate, `LLM01`; no model or sandbox call | No |
-| 3 Runaway cost loop | Fixed benign steps in a new `loop-…` session with a low cap; each step is classified | Steps run until a reservation would pass the cap, then a budget `BLOCK` | Yes |
+| 3 Runaway cost loop | Fixed benign steps in a new `loop-…` session with a low cap; each step is classified | At the default cap, 3 steps run and step 4 is a budget `BLOCK` (expected, see below) | Yes |
 
 **Reset session** clears the spend of the session on screen and restores its default cap. After preset 3 it clears the `loop-…` session and returns to `demo`, whose spend is kept. Global spend and ledger entries are never cleared by reset; to start from nothing, stop all AgentGuard processes and delete `data/guard_state.db*`.
 
-Without a key, presets 1 and 3 show a classifier error `BLOCK` and nothing runs. Preset 3's step count depends on real token usage, so rehearse it and adjust `PRESET3_SESSION_CAP_GBP` if the breaker does not trip where you want it.
+Presets 1 and 2 have run end to end against the live API with the Docker sandbox. The preset 3 default cap was lowered from £0.002, which tripped at step 6, to £0.0017. The step 4 block at this cap has **not yet been confirmed live**. The step count depends on real token usage, so rehearse it and adjust `PRESET3_SESSION_CAP_GBP` if the breaker does not trip where you want it.
+
+Without a key, presets 1 and 3 show a classifier error `BLOCK` and nothing runs.
+
+### Rate limits
+
+In live runs, after about a dozen calls within seconds the API returned `429 RESOURCE_EXHAUSTED` and the guard blocked (fail closed). Use a billing-enabled key, or pause between demo runs.
+
+## Live measurements
+
+Measured on 2026-11-27 with `gemini-3.5-flash-lite`:
+
+| Check | Result |
+|---|---|
+| 3 benign actions | All `ALLOW` |
+| 2 injection prompts without regex signatures | Both `BLOCK`, `LLM01` |
+| Time per call | 0.6-1.1 s |
+| Cost per call | About £0.0002 at the configured rates (about 400 input and 50 output tokens) |
+
+This is a small sample, **not an accuracy measurement**. Your latency, token use and cost may differ.
 
 ## Known limits
 
@@ -170,7 +191,8 @@ Without a key, presets 1 and 3 show a classifier error `BLOCK` and nothing runs.
 - The regex gate can be bypassed (string building, import aliases, unusual spellings, other languages and more). It is not a security boundary.
 - It also has false positives: text that only discusses `rm -rf`, `eval(`, `.env` or "ignore all previous instructions" is blocked.
 - The classifier can be wrong, in either direction.
-- **The live classifier has not yet been verified.** Tests use fake responses; whether the live API accepts the request, how well it detects attacks, and its real cost and latency are unmeasured.
+- The classifier's accuracy has not been measured. It has been checked live on a [small sample](#live-measurements) only; the automated tests use fake responses.
+- API rate limits cause blocks: a rejected call fails closed, so legitimate actions are refused too.
 
 **Budget**
 - The budget covers only AgentGuard's own classifier and demo agent calls recorded in the ledger, not an external client's model spend.
