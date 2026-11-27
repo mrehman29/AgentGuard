@@ -2,14 +2,18 @@
 
 Standalone: the image holds only this file, so it defines its own models and
 limits. tests/test_sandboxes.py keeps them equal to the frozen contracts.
-The container must hold no secret: the code run here is untrusted.
+The container must hold no secret: the code run here is untrusted. It can reach
+this server, so requests from inside the instance are refused (see _RequestGate).
 """
 
 import ctypes
+import errno
+import ipaddress
 import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,6 +22,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 MAX_CODE_CHARS = 20_000
@@ -25,6 +30,10 @@ MAX_OUTPUT_CHARS = 16 * 1024
 TIMEOUT_EXIT_CODE = 124
 READ_CHUNK_BYTES = 64 * 1024
 CLEANUP_DEADLINE_SEC = 2.0
+# The largest valid request: every character of the code escaped as a JSON surrogate pair.
+MAX_BODY_BYTES = 12 * MAX_CODE_CHARS + 1024
+# Local testing only. The image and the deployment must never set it.
+ALLOW_LOCAL_ENV = "AGENTGUARD_WORKER_ALLOW_LOCAL"
 
 PR_SET_DUMPABLE = 4
 PR_SET_CHILD_SUBREAPER = 36
@@ -33,8 +42,8 @@ PR_SET_NO_NEW_PRIVS = 38
 logger = logging.getLogger(__name__)
 
 # One execution at a time: cleanup kills every descendant of this process.
-# A second request is refused, never queued: running code can reach this port
-# and must not be able to leave work behind for after its own run.
+# A second request is refused, not queued. This is not a defence against the code
+# being run: _RequestGate is.
 _run_lock = threading.Lock()
 
 
@@ -183,6 +192,70 @@ def _run(request: ExecuteRequest) -> ExecuteResponse:
     )
 
 
+def _is_external(client) -> bool:
+    """True only if the peer address is certainly not one of this instance's own.
+
+    Code run here has no privilege to send from an address that is not local, so
+    all its connections fail this test. Anything unclear counts as local.
+    """
+    try:
+        host, _port = client
+        address = ipaddress.ip_address(host)
+        address = getattr(address, "ipv4_mapped", None) or address
+        if address.is_loopback or address.is_unspecified or address.is_multicast:
+            return False
+        family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.bind((str(address), 0))
+    except OSError as exc:
+        return exc.errno == errno.EADDRNOTAVAIL  # the kernel: not an address of ours
+    except (TypeError, ValueError):  # no peer address, or not an IP address
+        return False
+    return False  # we could bind to it, so it is ours
+
+
+def _refusal(scope) -> tuple[int, str] | None:
+    """Decided from the connection and headers alone, before any body is read."""
+    client = scope.get("client")
+    if os.environ.get(ALLOW_LOCAL_ENV) != "1" and not _is_external(client):
+        logger.warning("refused a request from inside the instance: peer %s", client)
+        return 403, "requests from inside the instance are refused"
+    headers = dict(scope["headers"])
+    if b"transfer-encoding" in headers:
+        return 411, "a Content-Length is required"
+    try:
+        length = int(headers.get(b"content-length", b"0"))
+    except ValueError:
+        return 400, "invalid Content-Length"
+    if length > MAX_BODY_BYTES:
+        return 413, "the request is too large"
+    return None
+
+
+class _RequestGate:
+    """ASGI middleware in front of every route.
+
+    The peer address is fixed when the connection is accepted, so this holds
+    however late a request is handled. It needs uvicorn's proxy headers off:
+    otherwise a header can replace the peer address.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "lifespan":
+            await self.app(scope, receive, send)
+        elif scope["type"] != "http":
+            await send({"type": "websocket.close"})
+        elif refusal := _refusal(scope):
+            status, reason = refusal
+            response = PlainTextResponse(reason, status, headers={"connection": "close"})
+            await response(scope, receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     _harden()
@@ -190,6 +263,7 @@ async def _lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(_RequestGate)
 
 
 @app.get("/health")
@@ -207,7 +281,12 @@ def execute(request: ExecuteRequest) -> ExecuteResponse:
         _run_lock.release()
 
 
-if __name__ == "__main__":
+def serve(host: str = "0.0.0.0") -> None:
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run(app, host=host, port=port, proxy_headers=False)
+
+
+if __name__ == "__main__":
+    serve()

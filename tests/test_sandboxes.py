@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import errno
 import json
 import os
 import socket
@@ -17,6 +18,7 @@ import httpx
 import pytest
 
 from core import schemas
+from core.config import get_settings
 from core.schemas import SandboxRequest
 from sandbox import cloudrun_provider, docker_provider, get_sandbox_provider, worker
 from sandbox.cloudrun_provider import CloudRunSandboxProvider
@@ -44,14 +46,24 @@ def test_worker_models_match_the_contracts():
 
 @pytest.fixture(scope="module")
 def worker_url():
-    """The real worker, in its own process, on a free local port."""
+    """The real worker, in its own process, on a free local port.
+
+    Test client and code both connect from loopback, so this one opts out of the
+    refusal of local requests.
+    """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "worker:app", "--host", "127.0.0.1", "--port", str(port)],
+        [sys.executable, "-c", "import worker; worker.serve('127.0.0.1')"],
         cwd=SANDBOX_DIR,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "AGENTGUARD_CANARY": "leaked"},
+        env={
+            **os.environ,
+            "PORT": str(port),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "AGENTGUARD_CANARY": "leaked",
+            worker.ALLOW_LOCAL_ENV: "1",
+        },
     )
     url = f"http://127.0.0.1:{port}"
     try:
@@ -163,7 +175,7 @@ def test_worker_kills_double_forked_daemon(worker_url):
 
 
 def test_worker_refuses_requests_while_busy(worker_url):
-    """Running code cannot queue more work on the worker for later."""
+    """Ordinary concurrency: a second request during a run is refused."""
     code = (
         "import urllib.request as u, urllib.error\n"
         f"r = u.Request('{worker_url}/execute', data=b'{{\"code\": \"print(1)\"}}',"
@@ -603,3 +615,263 @@ def test_configured_provider_is_selected(monkeypatch):
     for name in ("docker", "cloudrun"):
         monkeypatch.setenv("SANDBOX_PROVIDER", name)
         assert get_sandbox_provider().provider_name == name
+
+
+# B-1: code running in the worker must not be able to submit work to the worker.
+
+# Runs inside the sandbox. It fires requests at its own worker without reading the
+# replies, then exits. A queued copy leaves a marker and does the same again.
+ATTACK = r"""
+import json, socket
+if not globals().get('ROOT'):
+    open('/tmp/queued-code-ran', 'a').write('x')
+own = socket.gethostbyname(socket.gethostname())
+payload = json.dumps({'code': 'S=%r\nexec(S)' % S, 'timeout_sec': 2}).encode()
+def request(method, path, body=b'', extra=''):
+    head = f'{method} {path} HTTP/1.1\r\nHost: x\r\n{extra}Content-Type: application/json\r\n'
+    return (head + f'Content-Length: {len(body)}\r\n\r\n').encode() + body
+spoof = ('X-Forwarded-For: 203.0.113.9:4444\r\nForwarded: for=203.0.113.9\r\n'
+         'X-Real-IP: 203.0.113.9\r\n')
+held, sent = [], 0
+def fire(target, data, source=None, family=socket.AF_INET):
+    global sent
+    try:
+        s = socket.socket(family)
+        s.settimeout(0.5)
+        if source:
+            s.bind((source, 0))
+        s.connect((target, 8080))
+        s.sendall(data)
+        held.append(s)  # kept open, never read
+        sent += 1
+    except OSError:
+        pass
+for _ in range(FILLERS):
+    fire('127.0.0.1', request('GET', '/health'))
+for i in range(COPIES):
+    target = ('127.0.0.1', '127.0.0.2', '0.0.0.0', own)[i % 4]
+    source = (None, own, '127.0.0.3')[i % 3]
+    fire(target, request('POST', '/execute', payload, spoof if i % 2 else ''), source)
+# Several requests on one keep-alive connection.
+fire('127.0.0.1', request('GET', '/health') * 20 + request('POST', '/execute', payload) * 5)
+fire(own, request('POST', '/execute', payload, spoof) * 5)
+fire('::1', request('POST', '/execute', payload), family=socket.AF_INET6)
+print(sent)
+"""
+
+
+@pytest.fixture
+def image_worker():
+    """The worker as the image starts it. Requests from the test arrive from outside."""
+    name = f"agentguard-test-worker-{os.urandom(4).hex()}"
+    image = get_settings().sandbox_docker_image
+    subprocess.run(
+        ["docker", "run", "-d", "--rm", "--pull", "never", "--name", name,
+         "-p", "127.0.0.1::8080", image],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    try:
+        port = subprocess.run(
+            ["docker", "port", name, "8080"], check=True, capture_output=True, text=True
+        ).stdout.strip().rsplit(":", 1)[1]
+        url = f"http://127.0.0.1:{port}"
+        for _ in range(100):
+            try:
+                if httpx.get(f"{url}/health", trust_env=False).status_code == 200:
+                    break
+            except httpx.TransportError:
+                time.sleep(0.1)
+        else:
+            pytest.fail("worker container did not start")
+        yield url, name
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+@needs_docker
+@pytest.mark.parametrize("fillers,copies", [(0, 100), (100, 20), (300, 50), (800, 50), (0, 200)])
+def test_code_cannot_submit_work_to_its_own_worker(image_worker, fillers, copies):
+    url, _ = image_worker
+    # Queued copies are the same program without ROOT.
+    attack = f"FILLERS, COPIES = {fillers}, {copies}\n" + ATTACK
+    code = f"ROOT = True\nS = {attack!r}\nexec(S)"
+    result = post(url, code)
+    assert result["exit_code"] == 0, result["stderr"]
+    assert int(result["stdout"]) >= fillers + copies  # the requests really were sent
+    time.sleep(3)
+    check = "import os; print(os.path.exists('/tmp/queued-code-ran'))"
+    for _ in range(50):
+        response = httpx.post(f"{url}/execute", json={"code": check}, timeout=20, trust_env=False)
+        if response.status_code != 429:
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("the worker is still busy with queued code")
+    assert response.json()["stdout"] == "False\n"
+
+
+@needs_docker
+def test_code_in_the_worker_gets_403_on_every_local_route(image_worker):
+    """Replies are read here: each route connects and is refused."""
+    url, _ = image_worker
+    code = r"""
+import socket
+own = socket.gethostbyname(socket.gethostname())
+def status(target, source=None, path='/execute', headers=''):
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        if source == 'freebind':
+            s.setsockopt(socket.IPPROTO_IP, 15, 1)  # IP_FREEBIND: needs no privilege
+            s.bind(('203.0.113.9', 0))
+        elif source:
+            s.bind((source, 0))
+        s.connect((target, 8080))
+        s.sendall(f'POST {path} HTTP/1.1\r\nHost: x\r\n{headers}Content-Length: 0\r\n\r\n'.encode())
+        return s.recv(100).split()[1].decode()
+    except OSError:
+        return 'no connection'
+spoof = 'X-Forwarded-For: 203.0.113.9:4444\r\nX-Forwarded-Proto: https\r\n'
+for target in ('127.0.0.1', '127.1.2.3', '0.0.0.0', own):
+    for source in (None, own, '127.0.0.3'):
+        for headers in ('', spoof):
+            result = status(target, source, headers=headers)
+            if result not in ('403', 'no connection'):
+                print('OPEN', target, source, result)
+print(status('127.0.0.1'), status(own), status(own, path='/health'), status('127.0.0.1', headers=spoof))
+print(status(own, 'freebind'), status('127.0.0.1', 'freebind'))
+"""
+    result = post(url, code)
+    assert result["exit_code"] == 0, result["stderr"]
+    assert result["stdout"].splitlines() == [
+        "403 403 403 403",
+        "no connection no connection",
+    ]
+
+
+@needs_docker
+def test_image_worker_bounds_the_request_body(image_worker):
+    url, _ = image_worker
+    port = int(url.rsplit(":", 1)[1])
+
+    def status(headers):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+            # No body is sent: the answer must come without it.
+            client.sendall(f"POST /execute HTTP/1.1\r\nHost: x\r\n{headers}\r\n\r\n".encode())
+            return int(client.recv(100).split()[1])
+
+    assert status(f"Content-Length: {worker.MAX_BODY_BYTES + 1}") == 413
+    assert status("Content-Length: 1000000000") == 413
+    assert status("Transfer-Encoding: chunked") == 411
+    # The largest valid request still fits.
+    body = json.dumps({"code": "#" + "\U0001f600" * (schemas.MAX_CODE_CHARS - 1)})
+    assert len(body) <= worker.MAX_BODY_BYTES
+    response = httpx.post(
+        f"{url}/execute", content=body, headers={"Content-Type": "application/json"},
+        timeout=20, trust_env=False,
+    )
+    assert (response.status_code, response.json()["exit_code"]) == (200, 0)
+
+
+@needs_docker
+def test_image_never_opts_out():
+    image = get_settings().sandbox_docker_image
+    config = json.loads(
+        subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{json .Config}}", image],
+            check=True, capture_output=True, text=True,
+        ).stdout
+    )
+    assert worker.ALLOW_LOCAL_ENV not in json.dumps(config)
+    assert config["Cmd"] == ["python3", "worker.py"] and not config.get("Entrypoint")
+    assert worker.ALLOW_LOCAL_ENV not in (SANDBOX_DIR / "Dockerfile").read_text()
+
+
+async def gate(client, headers=(), kind="http"):
+    """Runs one request through the app. Returns the status, or the message type."""
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": kind, "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+        "scheme": "http", "path": "/health", "raw_path": b"/health", "query_string": b"",
+        "root_path": "", "headers": list(headers), "client": client,
+        "server": ("192.0.2.1", 8080),
+    }  # fmt: skip
+    await worker.app(scope, receive, send)
+    return sent[0].get("status", sent[0]["type"])
+
+
+def own_address():
+    """A non-loopback address of this machine. No packet is sent."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.connect(("203.0.113.1", 9))
+        except OSError:
+            pytest.skip("no non-loopback address")
+        return probe.getsockname()[0]
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "true", "yes", " 1"])
+async def test_local_requests_are_refused_by_default(monkeypatch, value):
+    monkeypatch.delenv(worker.ALLOW_LOCAL_ENV, raising=False)
+    if value is not None:
+        monkeypatch.setenv(worker.ALLOW_LOCAL_ENV, value)
+    assert await gate(("127.0.0.1", 5000)) == 403
+
+
+@pytest.mark.parametrize(
+    "client",
+    [
+        None,
+        ("127.0.0.1", 1),
+        ("127.255.0.9", 1),
+        ("::1", 1),
+        ("::ffff:127.0.0.1", 1),
+        ("0.0.0.0", 1),
+        ("::", 1),
+        ("224.0.0.1", 1),
+        ("fe80::1%nosuchlink", 1),
+        ("testclient", 1),
+        ("", 1),
+        ("127.0.0.1",),
+    ],
+)
+async def test_local_or_unclear_peers_are_refused(monkeypatch, client):
+    monkeypatch.delenv(worker.ALLOW_LOCAL_ENV, raising=False)
+    assert await gate(client) == 403
+
+
+async def test_own_address_is_refused_and_others_pass(monkeypatch):
+    monkeypatch.delenv(worker.ALLOW_LOCAL_ENV, raising=False)
+    own = own_address()
+    assert await gate((own, 1)) == 403
+    assert await gate((f"::ffff:{own}", 1)) == 403
+    # Wherever the front end connects from, if it is not our address.
+    for outside in ("203.0.113.9", "169.254.1.1"):
+        assert await gate((outside, 1)) == 200
+    assert await gate(("203.0.113.9", 1), kind="websocket") == "websocket.close"
+
+
+@pytest.mark.parametrize("failure", [errno.EACCES, errno.EAFNOSUPPORT, errno.EINVAL, None])
+async def test_peer_check_fails_closed(monkeypatch, failure):
+    """Any answer from the kernel other than "not our address" refuses."""
+    monkeypatch.delenv(worker.ALLOW_LOCAL_ENV, raising=False)
+
+    def broken(*args):
+        raise OSError(failure, "probe failed")
+
+    monkeypatch.setattr(worker.socket, "socket", broken)
+    assert await gate(("203.0.113.9", 1)) == 403
+
+
+async def test_serve_turns_proxy_headers_off(monkeypatch):
+    calls = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: calls.append(kwargs))
+    worker.serve()
+    assert calls[0]["proxy_headers"] is False and calls[0]["host"] == "0.0.0.0"
