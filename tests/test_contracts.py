@@ -271,7 +271,7 @@ async def test_source_and_events_pass_through(env):
         (guard_core.evaluate_action, "tool_name args session_id source label on_event record"),
         (pipeline.execute_guarded, "intent tool_name args session_id provider source label on_event"),
         (budget_store.SessionBudgetTracker.reserve, "self session_id estimate_gbp"),
-        (budget_store.SessionBudgetTracker.commit, "self reservation_id usage"),
+        (budget_store.SessionBudgetTracker.commit, "self reservation_id usage model"),
         (budget_store.SessionBudgetTracker.set_session_cap, "self session_id cap_gbp"),
         (budget_store.SessionBudgetTracker.recent_entries, "self limit"),
     ],

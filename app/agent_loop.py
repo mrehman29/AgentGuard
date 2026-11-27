@@ -12,12 +12,10 @@ from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from google import genai
-from google.genai import types
-
 from core import budget_store, guard_core
 from core.config import Settings, get_settings, token_cost_gbp
 from core.pipeline import execute_guarded
+from core.providers import ToolSpec, get_provider
 from core.schemas import (
     Decision,
     GuardEvaluation,
@@ -34,6 +32,23 @@ logger = logging.getLogger(__name__)
 
 MAX_PROMPT_CHARS = 20_000
 
+SYSTEM_INSTRUCTION = (
+    "You are a helpful Python data assistant. When asked to perform calculations, "
+    "data processing, or queries, generate and execute Python code using execute_python."
+)
+EXECUTE_PYTHON = ToolSpec(
+    name="execute_python",
+    description="Execute Python code in the secure sandbox environment.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "The Python code to execute."},
+            "timeout_sec": {"type": "integer", "description": "Timeout in seconds (1-5)."},
+        },
+        "required": ["code"],
+    },
+)
+
 
 def _validate_text(text: str, name: str = "text") -> str:
     """Validate text and reject surrogates."""
@@ -49,76 +64,21 @@ def _validate_text(text: str, name: str = "text") -> str:
 async def default_model_caller(
     prompt: str, settings: Settings
 ) -> tuple[TokenUsage, str | None, dict[str, Any] | None]:
-    """Call Gemini model using google.genai with AFC disabled.
+    """One turn of the agent's model. Proposed tools are not run here.
 
-    Returns (TokenUsage, optional_text_reply, optional_tool_call).
+    Returns (TokenUsage, optional_text_reply, optional_tool_call). Both optional
+    values are None if the output cannot be used.
     """
     _validate_text(prompt, "prompt")
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    client = genai.Client(api_key=settings.gemini_api_key)
-
-    execute_python_func = types.FunctionDeclaration(
-        name="execute_python",
-        description="Execute Python code in the secure sandbox environment.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "code": types.Schema(
-                    type=types.Type.STRING,
-                    description="The Python code to execute.",
-                ),
-                "timeout_sec": types.Schema(
-                    type=types.Type.INTEGER,
-                    description="Timeout in seconds (1-5).",
-                ),
-            },
-            required=["code"],
-        ),
-    )
-    tool = types.Tool(function_declarations=[execute_python_func])
-
-    config = types.GenerateContentConfig(
-        tools=[tool],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        temperature=0.0,
-        max_output_tokens=settings.budget_reserve_output_tokens,
-        system_instruction=(
-            "You are a helpful Python data assistant. When asked to perform calculations, "
-            "data processing, or queries, generate and execute Python code using execute_python."
-        ),
-    )
-
-    async with client.aio as aio_client:
-        response = await asyncio.wait_for(
-            aio_client.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
-                config=config,
-            ),
-            timeout=settings.classifier_timeout_sec,
+    # Not wait_for: on Python 3.11 it can swallow a cancel.
+    async with asyncio.timeout(settings.agent.timeout_sec):
+        reply = await get_provider(settings.agent).agent_turn(
+            SYSTEM_INSTRUCTION, prompt, [EXECUTE_PYTHON]
         )
-
-    usage_meta = response.usage_metadata
-    if usage_meta is None or getattr(usage_meta, "prompt_token_count", None) is None:
-        raise RuntimeError("Model response missing token usage metadata.")
-
-    prompt_tokens = usage_meta.prompt_token_count or 0
-    cand_tokens = usage_meta.candidates_token_count or 0
-    thought_tokens = usage_meta.thoughts_token_count or 0
-    usage = TokenUsage(
-        prompt_tokens=prompt_tokens,
-        candidates_tokens=cand_tokens,
-        thoughts_tokens=thought_tokens,
-    )
-
-    if response.function_calls:
-        fc = response.function_calls[0]
-        return usage, None, {"tool_name": fc.name, "args": dict(fc.args or {})}
-
-    text = response.text or ""
-    return usage, text, None
+    call = reply.tool_call
+    if call is not None:
+        return reply.usage, None, {"tool_name": call.name, "args": call.args}
+    return reply.usage, reply.text, None
 
 
 # Injectable/monkeypatchable caller for testing
@@ -325,7 +285,8 @@ async def _run_standard_workflow(
     reserve_cost = token_cost_gbp(
         settings,
         estimated_input_tokens,
-        settings.budget_reserve_output_tokens,
+        settings.agent.max_output_tokens,
+        settings.agent,
     )
     reservation_id = tracker.reserve(active_session, reserve_cost)
 
@@ -392,15 +353,17 @@ async def _run_standard_workflow(
     committed = False
     try:
         usage, text_reply, tool_call = await model_caller(prompt, settings)
-        commit_res = tracker.commit(reservation_id, usage)
+        commit_res = tracker.commit(reservation_id, usage, settings.agent)
         committed = True
+        # Charged either way: unusable output still costs.
+        unusable = text_reply is None and not tool_call
         tracker.record(
             LedgerEntry(
                 time=datetime.now(UTC),
                 source="web",
                 session_id=active_session,
                 label="agent turn",
-                outcome="OK",
+                outcome="ERROR" if unusable else "OK",
                 cost_gbp=commit_res.cost_gbp,
             )
         )
@@ -441,7 +404,7 @@ async def _run_standard_workflow(
     except (UnicodeEncodeError, UnicodeError):
         has_surrogates = True
 
-    if has_surrogates:
+    if has_surrogates or unusable:
         await queue.put(
             RunEvent(
                 type="run_error",

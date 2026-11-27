@@ -13,11 +13,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from google import genai
-from google.genai import errors, types
-
 from core import budget_store
-from core.config import Settings, get_settings, token_cost_gbp
+from core.config import get_settings, token_cost_gbp
+from core.providers import ModelError, ModelReply, get_provider
 from core.schemas import (
     MAX_CODE_CHARS,
     BudgetStatus,
@@ -305,54 +303,14 @@ def _elapsed_ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
-_client_cache: tuple[tuple[str, asyncio.AbstractEventLoop], genai.Client] | None = None
-
-
-def _make_client(settings: Settings) -> genai.Client:
-    """One client per key and event loop, so connections are reused. No retries."""
-    global _client_cache
-    key = (settings.gemini_api_key, asyncio.get_running_loop())
-    if _client_cache is None or _client_cache[0] != key:
-        client = genai.Client(api_key=settings.gemini_api_key, vertexai=False)
-        _client_cache = (key, client)
-    return _client_cache[1]
-
-
-def _token_usage(response: Any) -> TokenUsage:
-    usage = response.usage_metadata
-    if usage is None or usage.prompt_token_count is None:
-        raise ValueError("the response has no token usage")
-    return TokenUsage(
-        prompt_tokens=usage.prompt_token_count,
-        candidates_tokens=usage.candidates_token_count or 0,
-        thoughts_tokens=usage.thoughts_token_count or 0,
-    )
-
-
-def _parse_verdict(response: Any) -> OwaspVerdict:
-    candidates = response.candidates
-    if not candidates or candidates[0].finish_reason != types.FinishReason.STOP:
+def _parse_verdict(reply: ModelReply) -> OwaspVerdict:
+    if not reply.finished:
         raise ValueError("the model did not finish normally")
-    verdict = OwaspVerdict.model_validate_json(response.text or "")
+    verdict = OwaspVerdict.model_validate_json(reply.text or "")
     safe = verdict.owasp_tag is OwaspTag.SAFE
     if verdict.owasp_tag is OwaspTag.NA or safe != (verdict.decision is Decision.ALLOW):
         raise ValueError("the decision and tag disagree")
     return verdict
-
-
-async def _call_model(settings: Settings, payload: str) -> Any:
-    return await _make_client(settings).aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=payload,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=OwaspVerdict,
-            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
-            # Includes thought tokens, so output cannot cost more than reserved.
-            max_output_tokens=settings.budget_reserve_output_tokens,
-        ),
-    )
 
 
 def _budget_block(reason: str, gates_passed: list[Stage], start: float) -> GuardEvaluation:
@@ -365,17 +323,6 @@ def _budget_block(reason: str, gates_passed: list[Stage], start: float) -> Guard
         latency_ms=_elapsed_ms(start),
         gates_passed=gates_passed,
     )
-
-
-def _api_error_details(exc: Exception) -> str:
-    """The numeric code and status name of an API error, never its message."""
-    if not isinstance(exc, errors.APIError):
-        return ""
-    code = exc.code if isinstance(exc.code, int) else "unknown"
-    status = exc.status
-    if not (isinstance(status, str) and re.fullmatch(r"[A-Za-z_ ]{1,64}", status)):
-        status = "unknown"
-    return f" code={code} status={status}"
 
 
 def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
@@ -409,13 +356,14 @@ async def _classify(
 
     try:
         settings = get_settings()
-        if not settings.gemini_api_key:
+        model = settings.classifier
+        if not model.api_key:
             return fail("Guard error: no model API key is configured.")
         payload = json.dumps({"tool_name": tool_name, "args": args}, ensure_ascii=False)
         # The configured size covers the instructions and schema. A token is at
         # least one byte, so the payload's byte count bounds the rest.
         input_tokens = settings.budget_reserve_input_tokens + len(payload.encode())
-        estimate = token_cost_gbp(settings, input_tokens, settings.budget_reserve_output_tokens)
+        estimate = token_cost_gbp(settings, input_tokens, model.max_output_tokens, model)
         tracker = budget_store.get_tracker()
         reservation = tracker.reserve(session_id, estimate)
         if reservation is None:
@@ -426,12 +374,12 @@ async def _classify(
             on_event("budget_reserved", tracker.check_budget(session_id))
 
         # Not wait_for: on Python 3.11 it can swallow a cancel.
-        async with asyncio.timeout(settings.classifier_timeout_sec):
-            response = await _call_model(settings, payload)
+        async with asyncio.timeout(model.timeout_sec):
+            reply = await get_provider(model).classify(SYSTEM_INSTRUCTION, payload, OwaspVerdict)
         # Charge for the call before judging its output: bad output still costs.
-        cost = tracker.commit(reservation, _token_usage(response)).cost_gbp
+        cost = tracker.commit(reservation, reply.usage, model).cost_gbp
         reservation = None
-        verdict = _parse_verdict(response)
+        verdict = _parse_verdict(reply)
         if verdict.decision is Decision.ALLOW:
             passed.append(Stage.OWASP_LLM)
         return GuardEvaluation(
@@ -444,9 +392,12 @@ async def _classify(
     except TimeoutError:
         logger.warning("classifier timed out")
         return fail("Guard error: the classifier timed out.")
+    except ModelError as exc:
+        logger.warning("classifier failed: %s", exc)
+        return fail(f"Guard error: classifier failed ({exc.kind}).")
     except Exception as exc:
         # The type only: messages can echo arguments or request details.
-        logger.warning("classifier failed: %s%s", type(exc).__name__, _api_error_details(exc))
+        logger.warning("classifier failed: %s", type(exc).__name__)
         return fail(f"Guard error: classifier failed ({type(exc).__name__}).")
     finally:
         # Also runs on cancellation, so no reservation is left behind.

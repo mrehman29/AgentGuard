@@ -28,6 +28,7 @@ import core.config
 from core import budget_store, guard_core
 from core.config import PROJECT_ROOT, get_settings, token_cost_gbp
 from core.pipeline import execute_guarded
+from core.providers import gemini
 from core.schemas import Decision, OwaspTag, SandboxRequest, Stage
 from sandbox import docker_provider, get_sandbox_provider, worker
 
@@ -227,7 +228,7 @@ def env(monkeypatch, tmp_path, model, worker_url):
     gcloud.write_text("#!/bin/sh\necho fake-identity-token\n")
     gcloud.chmod(0o755)
     for name in list(os.environ):
-        if name.lower().endswith("_proxy") or name.startswith(("GOOGLE_", "GEMINI_")):
+        if name.lower().endswith("_proxy") or name.startswith(("GOOGLE_", "GEMINI_", "CLASSIFIER_", "AGENT_")):
             monkeypatch.delenv(name)
     containers = tmp_path / "containers.log"
     values = {
@@ -255,7 +256,7 @@ def env(monkeypatch, tmp_path, model, worker_url):
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(core.config, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setattr(budget_store, "_tracker", None)
-    monkeypatch.setattr(guard_core, "_client_cache", None)
+    monkeypatch.setattr(gemini, "_client_cache", None)
     monkeypatch.setattr(docker_provider, "_swept", True)
     monkeypatch.setattr("sandbox.cloudrun_provider._cached_token", None)
 

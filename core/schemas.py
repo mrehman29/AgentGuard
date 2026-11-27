@@ -47,7 +47,7 @@ Outcome = Literal[
 
 
 class OwaspVerdict(Frozen):
-    """The only model schema sent to Gemini."""
+    """The only schema sent to the classifier model."""
 
     decision: Decision
     risk_score: int = Field(ge=0, le=100)

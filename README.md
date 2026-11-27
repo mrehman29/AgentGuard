@@ -32,7 +32,7 @@ Request (web console or MCP client)
 
 | Path | Contents |
 |---|---|
-| `core/` | Pipeline, regex gate and classifier, budget ledger, schemas, settings |
+| `core/` | Pipeline, regex gate and classifier, model providers, budget ledger, schemas, settings |
 | `sandbox/` | Docker and Cloud Run providers, the worker and its image |
 | `app/` | Web API, demo agent, console (`app/static/`), MCP server |
 | `tests/` | Test suite |
@@ -124,7 +124,7 @@ Settings come from `.env` in the project root; real environment variables overri
 | Variable | Default | Meaning |
 |---|---|---|
 | `GEMINI_API_KEY` | empty | Gemini API key. Empty: the classifier blocks everything. |
-| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model for the classifier and the demo agent. |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Model, unless a role below sets its own. |
 | `INPUT_COST_PER_1M_USD` | `0.30` | Input token rate used for costing. |
 | `OUTPUT_COST_PER_1M_USD` | `2.50` | Output and thought token rate. |
 | `USD_TO_GBP` | `0.80` | Exchange rate. |
@@ -134,13 +134,27 @@ Settings come from `.env` in the project root; real environment variables overri
 | `SANDBOX_DOCKER_IMAGE` | `agentguard-sandbox:latest` | Local image for the Docker provider. |
 | `CLOUDRUN_SANDBOX_URL` | empty | HTTPS URL of a deployed worker. Calls use a `gcloud` identity token. |
 | `SQLITE_DB_PATH` | `data/guard_state.db` | Ledger database. Relative paths start at the project root. |
-| `CLASSIFIER_TIMEOUT_SEC` | `5` | Time limit for the classifier and the demo agent model calls. |
+| `CLASSIFIER_TIMEOUT_SEC` | `5` | Time limit for model calls (`AGENT_TIMEOUT_SEC` overrides it for the agent). |
 | `BUDGET_RESERVE_INPUT_TOKENS` | `610` | Input tokens assumed when reserving cost. |
-| `BUDGET_RESERVE_OUTPUT_TOKENS` | `512` | Output tokens reserved, and the model's output limit. |
+| `BUDGET_RESERVE_OUTPUT_TOKENS` | `512` | Output tokens reserved, and the model's output limit, unless a role sets its own. |
 | `PRESET3_SESSION_CAP_GBP` | `0.0017` | Session cap for the runaway loop preset. An older `.env` may still set `0.002`. |
 | `PRESET3_MAX_STEPS` | `6` | Most steps the loop preset attempts. |
 
-Rates, timeouts and reserve sizes must be above zero; a cap may be zero. Restart the server after changing `.env`.
+Rates, timeouts, reserve sizes and output limits must be above zero; a cap may be zero. The server does not start with an invalid setting. Restart it after changing `.env`.
+
+### Model per role
+
+The classifier and the demo agent can be set separately. All of these are optional: an unset classifier setting takes the value from the table above, and an unset agent setting takes the classifier's.
+
+| Variable (`CLASSIFIER_` or `AGENT_` prefix) | Meaning |
+|---|---|
+| `_PROVIDER` | Only `gemini` is available. |
+| `_BASE_URL` | API address. Empty: the provider's default. No credentials, query or fragment. |
+| `_MODEL` | Model name. |
+| `_API_KEY` | API key. Required if the role's URL differs from the one it would otherwise use, so a key is never sent elsewhere. |
+| `_INPUT_COST_PER_1M_USD`, `_OUTPUT_COST_PER_1M_USD` | Rates used to cost this role's calls. Set them when you change the model. |
+| `_TIMEOUT_SEC` | Time limit for a call. |
+| `_MAX_OUTPUT_TOKENS` | Output limit, also the output size reserved. |
 
 ## Tests
 

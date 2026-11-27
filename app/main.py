@@ -72,6 +72,7 @@ _mcp_app = mcp.streamable_http_app()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    get_settings()  # a bad setting stops the server here, with its name
     try:
         async with mcp.session_manager.run():
             yield

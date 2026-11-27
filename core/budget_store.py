@@ -12,14 +12,14 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from core.config import get_settings, token_cost_gbp
+from core.config import ModelSettings, get_settings, token_cost_gbp
 from core.schemas import BudgetStatus, CommitResult, LedgerEntry, TokenUsage
 
 logger = logging.getLogger(__name__)
 
 BUSY_TIMEOUT_MS = 5000
 # A reservation left by a process that died stops counting after this many
-# classifier timeouts. It can still be committed if its call finishes late.
+# of the longer model timeouts. It can still be committed if its call finishes late.
 RESERVATION_TTL_TIMEOUTS = 12
 
 _SCHEMA = (
@@ -138,7 +138,9 @@ class SessionBudgetTracker:
     def reserve(self, session_id: str, estimate_gbp: float) -> str | None:
         """Return a reservation id, or None if a cap would be exceeded."""
         _check_amount(estimate_gbp)
-        ttl = get_settings().classifier_timeout_sec * RESERVATION_TTL_TIMEOUTS
+        settings = get_settings()
+        timeout = max(settings.classifier.timeout_sec, settings.agent.timeout_sec)
+        ttl = timeout * RESERVATION_TTL_TIMEOUTS
         with self._transaction() as db:
             now = time.time()
             status = self._status(db, session_id)
@@ -159,20 +161,28 @@ class SessionBudgetTracker:
             )
             return reservation_id
 
-    def commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
+    def commit(
+        self, reservation_id: str, usage: TokenUsage, model: ModelSettings | None = None
+    ) -> CommitResult:
         """Replace a reservation with the actual cost. Unknown id: KeyError.
 
+        The cost is at the rates of the model called (default: the classifier's).
         A database error is retried once, so a billed call is not lost to it.
         """
         try:
-            return self._commit(reservation_id, usage)
+            return self._commit(reservation_id, usage, model)
         except sqlite3.Error:
             logger.warning("commit failed; retrying once")
-            return self._commit(reservation_id, usage)
+            return self._commit(reservation_id, usage, model)
 
-    def _commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
+    def _commit(
+        self, reservation_id: str, usage: TokenUsage, model: ModelSettings | None
+    ) -> CommitResult:
         cost = token_cost_gbp(
-            get_settings(), usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
+            get_settings(),
+            usage.prompt_tokens,
+            usage.candidates_tokens + usage.thoughts_tokens,
+            model,
         )
         with self._transaction() as db:
             row = db.execute(

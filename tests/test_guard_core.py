@@ -13,6 +13,7 @@ from google.genai import errors, types
 
 from core import budget_store, guard_core, pipeline
 from core.config import PROJECT_ROOT, get_settings, token_cost_gbp
+from core.providers import gemini
 from core.schemas import Decision, LedgerEntry, OwaspTag, Stage, TokenUsage
 
 USAGE = TokenUsage(prompt_tokens=400, candidates_tokens=60, thoughts_tokens=20)
@@ -484,7 +485,7 @@ def model(monkeypatch):
         return state.response
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
-    monkeypatch.setattr(guard_core, "_make_client", lambda settings: client)
+    monkeypatch.setattr(gemini, "_make_client", lambda api_key, base_url: client)
     return state
 
 
@@ -645,7 +646,7 @@ async def test_cancel_as_the_reply_arrives_is_not_swallowed(monkeypatch, tracker
         return await pending
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
-    monkeypatch.setattr(guard_core, "_make_client", lambda settings: client)
+    monkeypatch.setattr(gemini, "_make_client", lambda api_key, base_url: client)
     ran = []
 
     class Provider:
