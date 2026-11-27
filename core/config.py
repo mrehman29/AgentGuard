@@ -76,3 +76,12 @@ def get_settings() -> Settings:
         preset3_session_cap_gbp=_number("PRESET3_SESSION_CAP_GBP", 0.002),
         preset3_max_steps=_number("PRESET3_MAX_STEPS", 6, int),
     )
+
+
+def token_cost_gbp(settings: Settings, input_tokens: int, output_tokens: int) -> float:
+    """Cost of a model call. output_tokens includes thought tokens."""
+    usd = (
+        input_tokens * settings.input_cost_per_1m_usd
+        + output_tokens * settings.output_cost_per_1m_usd
+    ) / 1_000_000
+    return usd * settings.usd_to_gbp

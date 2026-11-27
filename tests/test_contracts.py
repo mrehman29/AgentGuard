@@ -7,7 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from core import budget_store, guard_core, pipeline
-from core.config import ConfigError, get_settings
+from core.config import ConfigError, get_settings, token_cost_gbp
 from core.schemas import (
     BudgetStatus,
     Decision,
@@ -211,3 +211,9 @@ def test_bad_numeric_setting_is_rejected(monkeypatch, value):
 def test_api_key_is_not_in_repr(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "not-a-real-key")
     assert "not-a-real-key" not in repr(get_settings())
+
+
+def test_token_cost(monkeypatch):
+    for name, value in {"INPUT_COST_PER_1M_USD": "0.30", "OUTPUT_COST_PER_1M_USD": "2.50", "USD_TO_GBP": "0.80"}.items():
+        monkeypatch.setenv(name, value)
+    assert token_cost_gbp(get_settings(), 1_000_000, 1_000_000) == pytest.approx(2.24)
