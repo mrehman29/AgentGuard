@@ -17,7 +17,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 MAX_CODE_CHARS = 20_000
@@ -33,6 +33,8 @@ PR_SET_NO_NEW_PRIVS = 38
 logger = logging.getLogger(__name__)
 
 # One execution at a time: cleanup kills every descendant of this process.
+# A second request is refused, never queued: running code can reach this port
+# and must not be able to leave work behind for after its own run.
 _run_lock = threading.Lock()
 
 
@@ -197,8 +199,12 @@ def health() -> dict[str, str]:
 
 @app.post("/execute")
 def execute(request: ExecuteRequest) -> ExecuteResponse:
-    with _run_lock:
+    if not _run_lock.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="the sandbox is busy")
+    try:
         return _run(request)
+    finally:
+        _run_lock.release()
 
 
 if __name__ == "__main__":

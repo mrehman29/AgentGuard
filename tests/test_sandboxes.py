@@ -162,6 +162,19 @@ def test_worker_kills_double_forked_daemon(worker_url):
     assert not alive(int(result["stdout"]))
 
 
+def test_worker_refuses_requests_while_busy(worker_url):
+    """Running code cannot queue more work on the worker for later."""
+    code = (
+        "import urllib.request as u, urllib.error\n"
+        f"r = u.Request('{worker_url}/execute', data=b'{{\"code\": \"print(1)\"}}',"
+        " headers={'Content-Type': 'application/json'})\n"
+        "try:\n    u.build_opener(u.ProxyHandler({})).open(r, timeout=3); print('RAN')\n"
+        "except urllib.error.HTTPError as e:\n    print(e.code)\n"
+    )
+    assert post(worker_url, code)["stdout"] == "429\n"
+    assert post(worker_url, "print(1)")["stdout"] == "1\n"
+
+
 @pytest.mark.parametrize(
     "body", [{}, {"code": "x" * 20_001}, {"code": "1", "timeout_sec": 6}, {"code": 5}]
 )
