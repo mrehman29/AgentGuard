@@ -25,7 +25,7 @@ from app import agent_loop
 from app.agent_loop import default_model_caller
 from app.main import app, lifespan
 from core import budget_store, guard_core
-from core.config import PROJECT_ROOT, Settings
+from core.config import PROJECT_ROOT, Settings, get_settings
 from core.schemas import (
     BudgetStatus,
     CommitResult,
@@ -273,7 +273,9 @@ def test_get_config(client_env):
         assert "[SYSTEM OVERRIDE" in preset_map["injection"]["prompt"]
 
         assert preset_map["loop"]["title"] == "Runaway cost loop"
-        assert preset_map["loop"]["description"] == "Cap £0.0020. Expected: budget BLOCK"
+        settings = get_settings()
+        cap_formatted = f"£{settings.preset3_session_cap_gbp:.4f}"
+        assert preset_map["loop"]["description"] == f"Cap {cap_formatted}. Expected: budget BLOCK"
 
         assert "session_cap_gbp" in data
         assert "global_cap_gbp" in data
@@ -915,3 +917,38 @@ async def test_mcp_stdio_subprocess(tmp_path):
     con.close()
     assert len(rows) > 0
     assert any("mcp" in r[0] for r in rows)
+
+
+async def test_mcp_invalid_args_with_valid_session_id_records_caller_session(client_env):
+    import httpx
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    async with lifespan(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1", follow_redirects=True) as http_client:
+            async with streamable_http_client("http://127.0.0.1/mcp", http_client=http_client) as (read_stream, write_stream, _):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+
+                    # Invalid JSON with valid session_id="caller_session"
+                    res = await session.call_tool(
+                        "guard_check_action",
+                        {"tool_name": "execute_python", "args_json": "not-json", "session_id": "caller_session"},
+                    )
+                    assert res.structuredContent["decision"] == "BLOCK"
+                    assert any(
+                        e.source == "mcp" and e.session_id == "caller_session" and e.label == "check" and e.outcome == "BLOCK error"
+                        for e in client_env.entries
+                    )
+
+                    # Invalid provider with valid session_id="caller_exec_session"
+                    res_exec = await session.call_tool(
+                        "guard_execute_sandbox",
+                        {"code": "print(1)", "session_id": "caller_exec_session", "provider": "x" * 100},
+                    )
+                    assert res_exec.structuredContent["decision"] == "BLOCK"
+                    assert any(
+                        e.source == "mcp" and e.session_id == "caller_exec_session" and e.label == "execute" and e.outcome == "BLOCK error"
+                        for e in client_env.entries
+                    )
