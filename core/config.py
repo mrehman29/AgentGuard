@@ -80,8 +80,9 @@ def _check_url(name: str, url: str) -> None:
             bool(parts.hostname)
             and (parts.scheme == "https" or (parts.scheme == "http" and _is_loopback(parts.hostname)))
             and not any(char in parts.netloc for char in "@\\")
-            and not parts.query
-            and not parts.fragment
+            # Even an empty one would swallow the API path appended to the URL.
+            and "?" not in url
+            and "#" not in url
             and all("!" <= char <= "~" for char in url)
         )
     except ValueError:

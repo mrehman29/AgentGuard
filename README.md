@@ -159,7 +159,7 @@ The classifier and the demo agent can be set separately. All of these are option
 Model calls:
 
 - Variables with these prefixes already set in your shell are read too, and override `.env`.
-- Redirects are never followed. `https` calls use the usual proxy and certificate variables (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`); plain `http` calls never go through a proxy.
+- Redirects are never followed. `https` calls trust the operating system's certificate store, or `SSL_CERT_FILE` / `SSL_CERT_DIR` if set, and use the usual proxy variables (`HTTPS_PROXY`, `NO_PROXY`). Plain `http` calls, allowed to this machine only, never go through a proxy.
 - `GOOGLE_GEMINI_BASE_URL`, if set in the process environment, replaces an empty URL and must pass the same rule. Vertex AI variables such as `GOOGLE_GENAI_USE_VERTEXAI` are ignored.
 - The classifier asks Gemini for the thinking level `MINIMAL`. With a model that does not support it, every classification fails and the action is blocked.
 - The demo agent runs a tool call only from a reply that finished normally. An empty reply is an error. Both are still charged. Partial text is shown as it is.

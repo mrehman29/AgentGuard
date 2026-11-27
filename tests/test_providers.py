@@ -21,9 +21,10 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
 from dotenv import dotenv_values
+from google.genai import errors, types
 from starlette.testclient import TestClient
 
 import core.config
@@ -371,7 +372,10 @@ def test_gemini_sdk_is_imported_only_by_its_provider():
 # --- transport ---
 
 
-@pytest.mark.parametrize("backend", ["", "httpx2"])
+BACKENDS = ["", "httpx2", "httpx"]  # GOOGLE_GENAI_HTTP_CLIENT
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("operation", OPERATIONS)
 async def test_redirects_are_not_followed(contract, server, monkeypatch, operation, backend):
     monkeypatch.setenv("GOOGLE_GENAI_HTTP_CLIENT", backend)
@@ -383,21 +387,30 @@ async def test_redirects_are_not_followed(contract, server, monkeypatch, operati
         assert len(server.requests) == 1 and other.requests == []
 
 
-@pytest.mark.parametrize("backend", ["", "httpx2"])
+async def test_the_sdks_synchronous_client_follows_no_redirect(contract, server):
+    with fake_server() as other:
+        server.status, server.location = 307, f"{other.url}/elsewhere"
+        client = gemini._client(KEY, server.url)
+        with pytest.raises(errors.APIError):
+            await asyncio.to_thread(client.models.generate_content, model="m", contents="x")
+        assert len(server.requests) == 1 and other.requests == []
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("operation", OPERATIONS)
-async def test_requests_go_through_httpx(contract, server, monkeypatch, operation, backend):
+async def test_requests_go_through_httpx2(contract, server, monkeypatch, operation, backend):
     monkeypatch.setenv("GOOGLE_GENAI_HTTP_CLIENT", backend)
     sent = []
-    send = httpx.AsyncClient.send
+    send = httpx2.AsyncClient.send
 
     async def spy(self, request, **kwargs):
         sent.append((self.follow_redirects, self.timeout))
         return await send(self, request, **kwargs)
 
-    monkeypatch.setattr(httpx.AsyncClient, "send", spy)
+    monkeypatch.setattr(httpx2.AsyncClient, "send", spy)
     server.body = contract.reply(text=VERDICT)
     await operation()
-    assert sent == [(False, httpx.Timeout(None))]
+    assert sent == [(False, httpx2.Timeout(None))]
 
 
 @pytest.mark.parametrize("operation", OPERATIONS)
@@ -412,16 +425,6 @@ async def test_vertex_variables_are_ignored(contract, server, monkeypatch, opera
     before, after = server.requests
     assert after.path == before.path and after.body == before.body
     assert after.headers["x-goog-api-key"] == KEY
-
-
-async def test_a_reply_slower_than_httpx_default_is_waited_for(contract, server, monkeypatch):
-    monkeypatch.setenv("CLASSIFIER_TIMEOUT_SEC", "20")
-    server.body, server.delay = contract.reply(text=VERDICT), 5.5
-    guard, turn = await asyncio.gather(
-        guard_core.evaluate_action("execute_python", {"code": "1"}, "demo"),
-        agent_loop.default_model_caller("do it", get_settings()),
-    )
-    assert guard.decision is Decision.ALLOW and turn[1] == VERDICT
 
 
 async def test_two_roles_reuse_two_clients(contract, server, monkeypatch):
@@ -451,6 +454,32 @@ def test_clients_of_closed_loops_are_dropped():
     asyncio.run(make("one"))
     asyncio.run(make("two"))
     assert [key for key, _, _ in gemini._clients] == ["two"]
+
+
+# A range that some HTTP libraries cannot parse.
+IPV6_RANGE = "localhost,127.0.0.1,::1/128,fd00::/8"
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        {"NO_PROXY": IPV6_RANGE},
+        {"NO_PROXY": "::1/128"},
+        {"HTTP_PROXY": "not a url", "HTTPS_PROXY": "ftp://x", "ALL_PROXY": "socks9://[bad"},
+    ],
+)
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_plain_http_to_this_machine_never_fails_on_proxy_variables(
+    server, monkeypatch, operation, variables
+):
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", server.url)
+    server.body = FakeGemini.reply(text=VERDICT)
+    with fake_server() as proxy:
+        monkeypatch.setenv("HTTP_PROXY", proxy.url)
+        for name, value in variables.items():
+            monkeypatch.setenv(name, value)
+        assert (await operation()).text == VERDICT
+        assert proxy.requests == [] and len(server.requests) == 1
 
 
 @pytest.mark.parametrize("variable", ["HTTP_PROXY", "ALL_PROXY"])
@@ -506,10 +535,84 @@ def https(certificate, monkeypatch):
         yield state
 
 
+def trust_in_system_store(monkeypatch, cafile):
+    """As if the certificate had been added to the operating system's store."""
+    paths = ssl.get_default_verify_paths()._replace(openssl_cafile=cafile)
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: paths)
+
+
+@pytest.fixture
+def no_certificate_variables(monkeypatch):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_https_trusts_the_system_store(
+    https, certificate, no_certificate_variables, monkeypatch, operation
+):
+    trust_in_system_store(monkeypatch, certificate.path)
+    assert (await operation()).text == VERDICT
+    assert len(https.requests) == 1
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_https_trusts_ssl_cert_dir(
+    https, certificate, no_certificate_variables, monkeypatch, tmp_path, operation
+):
+    digest = subprocess.run(
+        ["openssl", "x509", "-hash", "-noout", "-in", certificate.path],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    shutil.copy(certificate.path, tmp_path / f"{digest}.0")
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    assert (await operation()).text == VERDICT
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_https_loads_ssl_cert_file_and_ssl_cert_dir_together(
+    https, certificate, monkeypatch, tmp_path, operation
+):
+    """As the SDK's default does: httpx2 alone would stop at the file."""
+    other = tmp_path / "other.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-keyout", str(tmp_path / "other.key"), "-out", str(other), "-subj", "/CN=other",
+        ],
+        check=True, capture_output=True, timeout=30,
+    )
+    digest = subprocess.run(
+        ["openssl", "x509", "-hash", "-noout", "-in", certificate.path],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    shutil.copy(certificate.path, tmp_path / f"{digest}.0")
+    monkeypatch.setenv("SSL_CERT_FILE", str(other))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    assert (await operation()).text == VERDICT
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_https_with_an_ipv6_range_in_no_proxy(https, certificate, monkeypatch, operation):
+    monkeypatch.setenv("SSL_CERT_FILE", certificate.path)
+    with fake_server() as proxy:
+        monkeypatch.setenv("HTTPS_PROXY", proxy.url)
+        monkeypatch.setenv("NO_PROXY", IPV6_RANGE)
+        assert (await operation()).text == VERDICT
+        assert proxy.requests == [] and len(https.requests) == 1
+        # The range alone excludes nothing here: the proxy is used, without an error.
+        monkeypatch.setenv("NO_PROXY", "::1/128")
+        gemini._clients.clear()
+        with pytest.raises(ModelError):
+            await operation()
+        assert [r.method for r in proxy.requests] == ["CONNECT"]
+
+
 @pytest.mark.parametrize("operation", OPERATIONS)
 async def test_https_trusts_ssl_cert_file(https, certificate, monkeypatch, operation):
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    # Neither the system store nor anything else knows this certificate yet.
     with pytest.raises(ModelError, match="ConnectError"):
         await operation()
     assert https.requests == []
@@ -659,6 +762,8 @@ def test_allowed_urls(monkeypatch, name, url):
         "http://localhost.example", "http://127.0.0.1.example",
         f"http://127.0.0.1\\@models.example/{KEY}", f"https://user:{KEY}@host.example",
         f"https://host.example/?key={KEY}", f"ftp://{KEY}", f" https://{KEY}.example/ a",
+        f"https://{KEY}.example/v1?", f"https://{KEY}.example/v1#", "http://127.0.0.1:8000#",
+        "http://127.0.0.1:8000?",
     ],
 )
 def test_refused_urls_are_not_echoed(monkeypatch, name, url):
@@ -955,10 +1060,14 @@ async def test_agent_has_its_own_timeout(contract, server, monkeypatch):
     ],
 )
 async def test_unusable_classifier_output_blocks_and_is_charged(
-    rates, server, sandbox, reply
+    rates, server, sandbox, reply, caplog
 ):
+    caplog.set_level(logging.DEBUG)
+    if "text" in reply:
+        reply = {**reply, "text": f"{reply['text']} {KEY}"}
     server.body = rates.reply(**reply)
     result = await run_guarded()
+    assert_no_key(caplog, result)
     assert result.guard.decision is Decision.BLOCK
     assert result.guard.cost_gbp == spent() == pytest.approx(CLASSIFIER_COST)
     assert entries("step 1/1") == [("BLOCK error", pytest.approx(CLASSIFIER_COST))]
@@ -996,9 +1105,13 @@ CODE = {"code": "print(1)"}
         ("execute_python", CODE), (None, CODE), ("", CODE), ("  ", CODE),
     ],
 )
-async def test_agent_tool_calls(rates, server, sandbox, monkeypatch, tool_call, finished):
+async def test_agent_tool_calls(
+    rates, server, sandbox, monkeypatch, caplog, tool_call, finished
+):
+    caplog.set_level(logging.DEBUG)
     server.body = rates.reply(tool_call=tool_call, finished=finished)
     events = await run_agent(monkeypatch)
+    assert_no_key(caplog, *events)
     accepted = finished and tool_call[0] == "execute_python"
     assert sandbox == (["print(1)"] if accepted else [])
     assert events[-1].type == ("run_finished" if accepted else "run_error")
@@ -1030,9 +1143,11 @@ async def test_caller_rejects_arguments_that_are_not_an_object(monkeypatch, argu
 
 @pytest.mark.parametrize("finished", [True, False])
 @pytest.mark.parametrize("text", ["partial answer", "", " \n "])
-async def test_agent_text(rates, server, sandbox, monkeypatch, text, finished):
+async def test_agent_text(rates, server, sandbox, monkeypatch, caplog, text, finished):
+    caplog.set_level(logging.DEBUG)
     server.body = rates.reply(text=text, finished=finished)
     events = await run_agent(monkeypatch)
+    assert_no_key(caplog, *events)
     shown = bool(text.strip())
     assert [e.text for e in events if e.type == "agent_reply"] == ([text] if shown else [])
     assert events[-1].type == ("run_finished" if shown else "run_error")
@@ -1102,7 +1217,8 @@ async def test_cap_refuses_both_calls(contract, server, sandbox, monkeypatch):
     assert server.requests == [] and sandbox == [] and reserved() == 0
 
 
-async def test_cancelled_classifier_call_releases(contract, server, sandbox):
+async def test_cancelled_classifier_call_releases(contract, server, sandbox, caplog):
+    caplog.set_level(logging.DEBUG)
     server.body, server.delay = contract.reply(text=VERDICT), 0.5
     task = asyncio.create_task(run_guarded())
     while not server.requests:
@@ -1112,9 +1228,11 @@ async def test_cancelled_classifier_call_releases(contract, server, sandbox):
         await task
     assert entries("step 1/1") == [("BLOCK error", 0)]
     assert spent() == reserved() == 0 and sandbox == []
+    assert_no_key(caplog)
 
 
-async def test_cancelled_agent_call_releases(contract, server, sandbox, monkeypatch):
+async def test_cancelled_agent_call_releases(contract, server, sandbox, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
     allow_every_action(monkeypatch)
     server.body, server.delay = contract.reply(text="late"), 0.5
     events = []
@@ -1131,17 +1249,74 @@ async def test_cancelled_agent_call_releases(contract, server, sandbox, monkeypa
         await task
     assert agent_entries() == [("ERROR", 0)]
     assert spent() == reserved() == 0 and sandbox == []
+    assert_no_key(caplog, *events)
+
+
+def reply_at_the_deadline(monkeypatch, text, first):
+    """The model answers in the same loop turn as the deadline; first says which wins."""
+
+    async def generate_content(**_):
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()
+        response = types.GenerateContentResponse.model_validate(FakeGemini.reply(text=text))
+
+        def arrive():
+            time.sleep(0.1)  # past the deadline, without yielding to the loop
+            if first == "reply":
+                pending.set_result(response)
+            else:  # queued ahead of the expired timer, so the task resumes after it
+                loop.call_soon(pending.set_result, response)
+
+        loop.call_soon(arrive)
+        return await pending
+
+    models = SimpleNamespace(generate_content=generate_content)
+    client = SimpleNamespace(aio=SimpleNamespace(models=models))
+    monkeypatch.setattr(gemini, "_client", lambda *_: client)
+    monkeypatch.setenv("CLASSIFIER_TIMEOUT_SEC", "0.05")
+
+
+@pytest.mark.parametrize("first", ["reply", "deadline"])
+async def test_classifier_reply_arriving_with_the_deadline(
+    rates, sandbox, monkeypatch, caplog, first
+):
+    caplog.set_level(logging.DEBUG)
+    reply_at_the_deadline(monkeypatch, VERDICT, first)
+    result = await run_guarded()
+    charged = first == "reply"
+    cost = pytest.approx(CLASSIFIER_COST if charged else 0)
+    assert (result.guard.decision is Decision.ALLOW) is charged
+    assert ("timed out" in result.guard.reason) is not charged
+    assert entries("step 1/1") == [("ALLOW" if charged else "BLOCK error", cost)]
+    assert spent() == cost and reserved() == 0 and sandbox == (["1"] if charged else [])
+    assert_no_key(caplog, result)
+
+
+@pytest.mark.parametrize("first", ["reply", "deadline"])
+async def test_agent_reply_arriving_with_the_deadline(
+    rates, sandbox, monkeypatch, caplog, first
+):
+    caplog.set_level(logging.DEBUG)
+    reply_at_the_deadline(monkeypatch, "hello", first)
+    events = await run_agent(monkeypatch)
+    charged = first == "reply"
+    cost = pytest.approx(AGENT_COST if charged else 0)
+    assert events[-1].type == ("run_finished" if charged else "run_error")
+    assert agent_entries() == [("OK" if charged else "ERROR", cost)]
+    assert spent() == cost and reserved() == 0 and sandbox == []
+    assert_no_key(caplog, *events)
 
 
 @pytest.mark.parametrize("role", ["classifier", "agent"])
 async def test_commit_that_fails_twice_blocks_and_releases(
-    contract, server, sandbox, monkeypatch, role
+    contract, server, sandbox, monkeypatch, caplog, role
 ):
+    caplog.set_level(logging.DEBUG)
     attempts = []
 
     def broken(*args):
         attempts.append(args)
-        raise sqlite3.OperationalError("database is locked")
+        raise sqlite3.OperationalError(f"database is locked {KEY}")
 
     monkeypatch.setattr(budget_store.get_tracker(), "_commit", broken)
     server.body = contract.reply(tool_call=("execute_python", CODE))
@@ -1149,9 +1324,11 @@ async def test_commit_that_fails_twice_blocks_and_releases(
         server.body = contract.reply(text=VERDICT)
         result = await run_guarded()
         assert result.guard.decision is Decision.BLOCK
+        assert_no_key(caplog, result)
     else:
         events = await run_agent(monkeypatch)
         assert events[-1].type == "run_error" and agent_entries() == [("ERROR", 0)]
+        assert_no_key(caplog, *events)
     assert len(attempts) == 2 and len(server.requests) == 1
     assert spent() == reserved() == 0 and sandbox == []
 

@@ -2,10 +2,11 @@
 
 import asyncio
 import os
+import ssl
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, ValidationError
@@ -19,16 +20,32 @@ _SCHEMA_KEYWORDS = {"type", "description", "properties", "required"}
 _clients: dict[tuple[str, str, asyncio.AbstractEventLoop], genai.Client] = {}
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """What the SDK verifies with by default: SSL_CERT_FILE or SSL_CERT_DIR if set,
+    otherwise the operating system's trust store.
+    """
+    cafile, capath = os.environ.get("SSL_CERT_FILE"), os.environ.get("SSL_CERT_DIR")
+    if cafile or capath:
+        return ssl.create_default_context(cafile=cafile, capath=capath)
+    return httpx2.create_ssl_context()
+
+
 def _new_client(api_key: str, base_url: str) -> genai.Client:
-    # Our own httpx client: the SDK's would follow redirects, carrying the key
-    # header to another server. No time limit here, because the caller sets one.
-    # Plain http is only allowed to this machine, so it must not go to a proxy.
-    transport = httpx.AsyncClient(
-        follow_redirects=False,
-        timeout=None,
-        trust_env=urlsplit(base_url).scheme != "http",
-    )
-    options: dict[str, Any] = {"httpx_async_client": transport}
+    # Our own clients, of the SDK's default library: the SDK's would follow
+    # redirects, carrying the key header to another server. No time limit here,
+    # because the caller sets one. Plain http is only allowed to this machine, so
+    # no proxy variable may affect it.
+    local = urlsplit(base_url).scheme == "http"
+    options: dict[str, Any] = {
+        "httpx_async_client": httpx2.AsyncClient(
+            follow_redirects=False,
+            timeout=None,
+            trust_env=not local,
+            verify=True if local else _ssl_context(),
+        ),
+        # Not used for model calls. Passed so that the SDK builds none of its own.
+        "httpx_client": httpx2.Client(follow_redirects=False, timeout=None, trust_env=False),
+    }
     if base_url:
         options["base_url"] = base_url
     # vertexai=False: the environment must not send the key to another service.
