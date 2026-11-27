@@ -78,7 +78,7 @@ def get_settings() -> Settings:
         classifier_timeout_sec=_number("CLASSIFIER_TIMEOUT_SEC", 5.0),
         budget_reserve_input_tokens=_number("BUDGET_RESERVE_INPUT_TOKENS", 610, int),
         budget_reserve_output_tokens=_number("BUDGET_RESERVE_OUTPUT_TOKENS", 512, int),
-        preset3_session_cap_gbp=_number("PRESET3_SESSION_CAP_GBP", 0.002, allow_zero=True),
+        preset3_session_cap_gbp=_number("PRESET3_SESSION_CAP_GBP", 0.0017, allow_zero=True),
         preset3_max_steps=_number("PRESET3_MAX_STEPS", 6, int),
     )
 
