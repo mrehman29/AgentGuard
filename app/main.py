@@ -219,7 +219,9 @@ async def get_budget(session_id: str) -> BudgetStatus:
 
 
 @app.post("/api/budget/{session_id}/reset", response_model=BudgetStatus)
-async def reset_budget(session_id: str) -> BudgetStatus:
+async def reset_budget(session_id: str, request: Request) -> BudgetStatus:
+    if request.headers.get("x-requested-with") != "AgentGuard":
+        raise HTTPException(status_code=403, detail="Forbidden")
     _reject_surrogates(session_id, "session_id")
     if not re.fullmatch(SESSION_ID_PATTERN, session_id):
         try:

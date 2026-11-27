@@ -84,7 +84,12 @@ async def guard_check_action(
     tool_name: str, args_json: str, session_id: str = "default"
 ) -> dict[str, Any]:
     """Screen an action before execution without running code."""
-    tracker = budget_store.get_tracker()
+    try:
+        tracker = budget_store.get_tracker()
+    except Exception:
+        logger.exception("MCP guard_check_action budget tracker unavailable")
+        return error_block("Guard error. Failing closed.").model_dump()
+
     try:
         tool_name = _validate_arg_str(tool_name, "tool_name", max_len=64)
         args_json = _validate_arg_str(args_json, "args_json", max_len=20_000)
@@ -142,12 +147,17 @@ async def guard_execute_sandbox(
 ) -> dict[str, Any]:
     """Execute Python code in the sandbox through the guarded pipeline."""
     try:
+        tracker = budget_store.get_tracker()
+    except Exception:
+        logger.exception("MCP guard_execute_sandbox budget tracker unavailable")
+        return error_block("Guard error. Failing closed.").model_dump()
+
+    try:
         code = _validate_arg_str(code, "code", max_len=20_000)
         session_id = _validate_session_id(session_id)
         if provider is not None:
             provider = _validate_arg_str(provider, "provider", max_len=32)
     except Exception as exc:
-        tracker = budget_store.get_tracker()
         try:
             tracker.record(
                 LedgerEntry(
@@ -163,23 +173,32 @@ async def guard_execute_sandbox(
             pass
         return error_block(f"Invalid request: {exc}.").model_dump()
 
-    result = await execute_guarded(
-        intent="MCP sandbox execution",
-        tool_name="execute_python",
-        args={"code": code},
-        session_id=session_id,
-        provider=provider,
-        source="mcp",
-        label="execute",
-    )
-    return result.model_dump()
+    try:
+        result = await execute_guarded(
+            intent="MCP sandbox execution",
+            tool_name="execute_python",
+            args={"code": code},
+            session_id=session_id,
+            provider=provider,
+            source="mcp",
+            label="execute",
+        )
+        return result.model_dump()
+    except Exception:
+        logger.exception("MCP guard_execute_sandbox failed")
+        return error_block("Guard error. Failing closed.").model_dump()
 
 
 @mcp.tool()
 async def guard_get_budget_status(session_id: str = "default") -> dict[str, Any]:
     """Get the current budget status for a session."""
-    if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
+    try:
         tracker = budget_store.get_tracker()
+    except Exception:
+        logger.exception("MCP guard_get_budget_status budget tracker unavailable")
+        return {"error": "Guard error. Failing closed."}
+
+    if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
         try:
             tracker.record(
                 LedgerEntry(
@@ -194,6 +213,10 @@ async def guard_get_budget_status(session_id: str = "default") -> dict[str, Any]
         except Exception:
             pass
         return {"error": "Invalid session_id", "session_id": "invalid"}
-    tracker = budget_store.get_tracker()
-    status = tracker.check_budget(session_id)
-    return status.model_dump()
+
+    try:
+        status = tracker.check_budget(session_id)
+        return status.model_dump()
+    except Exception:
+        logger.exception("MCP check_budget failed")
+        return {"error": "Guard error. Failing closed."}
