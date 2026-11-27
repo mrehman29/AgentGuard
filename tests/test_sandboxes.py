@@ -6,6 +6,7 @@ import base64
 import errno
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import tracemalloc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -195,7 +197,14 @@ def test_worker_rejects_invalid_requests(worker_url, body):
     assert httpx.post(f"{worker_url}/execute", json=body, trust_env=False).status_code == 422
 
 
+@pytest.fixture(autouse=True)
+def no_stale_sweep(monkeypatch):
+    """Only the sweep tests remove containers they did not just start."""
+    monkeypatch.setattr(docker_provider, "_swept", True)
+
+
 def _docker_ready():
+    docker_provider._swept = True  # no sweep while tests are collected
     try:
         return asyncio.run(DockerSandboxProvider().health_check())
     except Exception:
@@ -893,3 +902,91 @@ async def test_docker_proxy_settings_do_not_reach_the_code(containers, monkeypat
     names = [f"{kind}_proxy" for kind in ("http", "https", "ftp", "no", "all")]
     expected = dict.fromkeys(names + [name.upper() for name in names], "")
     assert ast.literal_eval(result.stdout) == expected
+
+
+def test_stale_pattern_matches_only_provider_names():
+    match = docker_provider.STALE_NAME.fullmatch
+    assert match(f"agentguard-{uuid4().hex}")
+    for other in (
+        "agentguard-sandbox",
+        "agentguard-test-worker-0a1b2c3d",
+        f"agentguard-{uuid4().hex}-db",
+        f"my-agentguard-{uuid4().hex}",
+        "n8n",
+    ):
+        assert not match(other)
+
+
+@needs_docker
+async def test_stale_containers_are_removed_once(monkeypatch):
+    image = get_settings().sandbox_docker_image
+    created, exited, running_name, later = (f"agentguard-{uuid4().hex}" for _ in range(4))
+    other = f"agentguard-test-keep-{uuid4().hex[:8]}"
+    mine = [created, exited, running_name, later, other]
+
+    def docker(*args):
+        subprocess.run(["docker", *args], check=True, capture_output=True)
+
+    def existing():
+        listed = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.split()
+        return set(listed) & set(mine)
+
+    # Limited to this test's containers, so nothing else on the host is touched.
+    pattern = re.compile("|".join([created, exited, running_name, later]))
+    monkeypatch.setattr(docker_provider, "STALE_NAME", pattern)
+    try:
+        docker("create", "--name", created, image, "true")
+        docker("create", "--name", other, image, "true")
+        docker("run", "--name", exited, "--network", "none", image, "true")
+        docker("run", "-d", "--name", running_name, "--network", "none", image, "sleep", "30")
+        before = existing()
+
+        monkeypatch.setattr(docker_provider, "_swept", False)
+        await DockerSandboxProvider().health_check()
+        assert existing() == before  # too young
+
+        monkeypatch.setattr(docker_provider, "STALE_AFTER_SEC", 0)
+        monkeypatch.setattr(docker_provider, "_swept", False)
+        assert (await docker_run("print(1)")).stdout == "1\n"
+        assert existing() == {running_name, other}
+
+        docker("create", "--name", later, image, "true")
+        await docker_run("print(1)")
+        assert later in existing()  # once per process
+    finally:
+        subprocess.run(["docker", "rm", "-f", *mine], capture_output=True)
+
+
+async def test_stale_sweep_retries_after_docker_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(docker_provider, "_swept", False)
+    await docker_provider._remove_stale_containers()
+    assert docker_provider._swept is False
+
+
+async def test_docker_parallel_runs_are_limited(monkeypatch):
+    active, peak = 0, 0
+
+    async def fake_run(self, request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.02)
+        finally:
+            active -= 1
+        return request.code
+
+    monkeypatch.setattr(DockerSandboxProvider, "_run", fake_run)
+    limit = docker_provider.MAX_PARALLEL_RUNS
+    tasks = [asyncio.create_task(docker_run(str(i))) for i in range(limit * 3)]
+    await asyncio.sleep(0.01)
+    tasks[-1].cancel()  # while waiting for a slot
+    tasks[0].cancel()  # while holding one
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert peak == limit
+    assert results[1:-1] == [str(i) for i in range(1, limit * 3 - 1)]
+    assert await docker_run("after") == "after"  # no slot was lost
