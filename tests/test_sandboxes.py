@@ -1,20 +1,25 @@
 """Sandbox tests (Track B). Docker tests are skipped without a daemon and image."""
 
 import asyncio
+import base64
+import json
 import os
 import socket
 import subprocess
 import sys
 import time
 import tracemalloc
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 import httpx
 import pytest
 
 from core import schemas
 from core.schemas import SandboxRequest
-from sandbox import docker_provider, worker
+from sandbox import cloudrun_provider, docker_provider, get_sandbox_provider, worker
+from sandbox.cloudrun_provider import CloudRunSandboxProvider
 from sandbox.docker_provider import DockerSandboxProvider
 
 SANDBOX_DIR = Path(worker.__file__).parent
@@ -388,3 +393,200 @@ async def test_docker_hung_client_is_unavailable_and_bounded(monkeypatch, tmp_pa
     result = await docker_run("print(1)", timeout_sec=1)
     assert (result.exit_code, result.timed_out) == (125, False)
     assert time.monotonic() - start < 10
+
+
+def jwt(exp):
+    body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+    return f"header.{body}.signature"
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    """Mocked gcloud: counts token requests and starts with an empty cache."""
+    issued = []
+
+    async def fake_token():
+        issued.append(jwt(int(time.time()) + 3600 + len(issued)))
+        return issued[-1]
+
+    monkeypatch.setattr(cloudrun_provider, "_gcloud_identity_token", fake_token)
+    monkeypatch.setattr(cloudrun_provider, "_cached_token", None)
+    return issued
+
+
+@pytest.fixture
+def service(monkeypatch):
+    """A scripted service: set `replies` to (status, body, delay) tuples."""
+
+    class State:
+        replies = []
+        seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            length = int(self.headers.get("Content-Length", 0))
+            State.seen.append((self.path, self.headers["Authorization"], self.rfile.read(length)))
+            status, body, delay = State.replies.pop(0)
+            time.sleep(delay)
+            try:
+                self.send_response(status)
+                self.send_header("Location", "/elsewhere")
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # the client gave up
+
+        do_POST = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", f"http://127.0.0.1:{server.server_port}/")
+    yield State
+    server.shutdown()
+    server.server_close()
+
+
+def reply(status=200, delay=0, **changes):
+    result = dict(
+        provider="cloudrun", stdout="ok", stderr="", truncated=False,
+        exit_code=0, duration_ms=3, timed_out=False,
+    )
+    return status, json.dumps(result | changes).encode(), delay
+
+
+async def cloud_run(code="print(1)", timeout_sec=5):
+    request = SandboxRequest(code=code, timeout_sec=timeout_sec)
+    return await CloudRunSandboxProvider().execute(request)
+
+
+def assert_cloud_unavailable(result, detail=""):
+    assert (result.provider, result.exit_code, result.timed_out) == ("cloudrun", 125, False)
+    assert result.stderr.startswith("Cloud Run sandbox unavailable") and detail in result.stderr
+    assert "signature" not in result.stderr
+
+
+async def test_cloudrun_runs_code_on_the_worker(worker_url, auth, monkeypatch):
+    monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", worker_url)
+    provider = get_sandbox_provider("cloudrun")
+    assert await provider.health_check() is True
+    result = await provider.execute(SandboxRequest(code="print(sum(range(101)))"))
+    assert (result.provider, result.stdout, result.exit_code) == ("cloudrun", "5050\n", 0)
+    timed = await cloud_run("while True: pass", timeout_sec=1)
+    assert (timed.exit_code, timed.timed_out) == (124, True)
+    capped = await cloud_run("print('\\x00' * 100_000)")
+    assert capped.truncated and len(capped.stdout) == schemas.MAX_OUTPUT_CHARS
+    assert len(auth) == 1  # cached across providers and requests
+
+
+async def test_cloudrun_sends_the_token_and_request(service, auth):
+    service.replies = [reply(provider="spoofed")]
+    result = await cloud_run("print(2)", timeout_sec=3)
+    path, header, body = service.seen[-1]
+    assert (path, header) == ("/execute", f"Bearer {auth[0]}")
+    assert json.loads(body) == {"code": "print(2)", "timeout_sec": 3}
+    assert (result.provider, result.stdout) == ("cloudrun", "ok")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_cloudrun_refreshes_a_refused_token_once(service, auth, status):
+    service.replies = [reply(status), reply()]
+    assert (await cloud_run()).exit_code == 0
+    assert [seen[1] for seen in service.seen] == [f"Bearer {token}" for token in auth]
+    assert len(auth) == 2
+    service.replies = [reply(status), reply(status)]
+    assert_cloud_unavailable(await cloud_run(), f"HTTP {status}")
+    assert service.replies == [] and cloudrun_provider._cached_token is None
+
+
+@pytest.mark.parametrize(
+    "scripted",
+    [
+        reply(500),
+        reply(302),
+        (200, b"not json", 0),
+        (200, b"{}", 0),
+        reply(stdout="x" * (schemas.MAX_OUTPUT_CHARS + 1)),
+        (200, b"x" * 1_000_000, 0),
+    ],
+)
+async def test_cloudrun_bad_responses_are_unavailable(service, auth, scripted):
+    service.replies = [scripted]
+    assert_cloud_unavailable(await cloud_run())
+    assert len(service.seen) == 1  # never run twice
+
+
+async def test_cloudrun_deadline(service, auth, monkeypatch):
+    monkeypatch.setattr(cloudrun_provider, "TOKEN_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(cloudrun_provider, "REQUEST_GRACE_SEC", 0)
+    monkeypatch.setattr(cloudrun_provider, "HEALTH_TIMEOUT_SEC", 0.2)
+    service.replies = [reply(delay=2)]
+    result = await cloud_run(timeout_sec=1)
+    assert_cloud_unavailable(result, "timed out")
+    assert 900 <= result.duration_ms < 1900
+    service.replies = [reply(delay=1)]
+    assert await CloudRunSandboxProvider().health_check() is False
+
+
+@pytest.mark.parametrize(
+    "url", ["", "http://example.com", "ftp://127.0.0.1", "example.com", "https://", "https://host:abc"]
+)
+async def test_cloudrun_rejects_bad_urls_without_a_token(auth, monkeypatch, url):
+    monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", url)
+    assert_cloud_unavailable(await cloud_run(), "CLOUDRUN_SANDBOX_URL")
+    assert await CloudRunSandboxProvider().health_check() is False
+    assert auth == []
+
+
+async def test_cloudrun_unreachable(auth, monkeypatch):
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", f"http://127.0.0.1:{closed.getsockname()[1]}")
+        assert_cloud_unavailable(await cloud_run(), "ConnectError")
+        assert await CloudRunSandboxProvider().health_check() is False
+
+
+def fake_gcloud(tmp_path, monkeypatch, script):
+    gcloud = tmp_path / "gcloud"
+    gcloud.write_text(f"#!/bin/sh\n{script}\n")
+    gcloud.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+
+async def test_gcloud_token_command(tmp_path, monkeypatch):
+    fake_gcloud(tmp_path, monkeypatch, 'echo "$1.$2.signature"')
+    assert await cloudrun_provider._gcloud_identity_token() == "auth.print-identity-token.signature"
+
+
+@pytest.mark.parametrize("script", ["echo secret.signature >&2; exit 1", "exit 0", "exec /bin/sleep 30"])
+async def test_gcloud_failures_are_unavailable(tmp_path, monkeypatch, script):
+    fake_gcloud(tmp_path, monkeypatch, script)
+    monkeypatch.setattr(cloudrun_provider, "TOKEN_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(cloudrun_provider, "_cached_token", None)
+    monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", "https://sandbox.invalid")
+    assert_cloud_unavailable(await cloud_run())
+
+
+async def test_gcloud_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cloudrun_provider, "_cached_token", None)
+    monkeypatch.setenv("CLOUDRUN_SANDBOX_URL", "https://sandbox.invalid")
+    assert_cloud_unavailable(await cloud_run(), "gcloud was not found")
+
+
+async def test_token_is_reused_until_near_expiry(auth, monkeypatch):
+    first = await cloudrun_provider._identity_token()
+    assert await cloudrun_provider._identity_token() == first
+    later = time.time() + 3600
+    monkeypatch.setattr(cloudrun_provider.time, "time", lambda: later)
+    assert await cloudrun_provider._identity_token() != first
+    assert cloudrun_provider._expiry("opaque") == later + 300
+
+
+def test_configured_provider_is_selected(monkeypatch):
+    for name in ("docker", "cloudrun"):
+        monkeypatch.setenv("SANDBOX_PROVIDER", name)
+        assert get_sandbox_provider().provider_name == name
