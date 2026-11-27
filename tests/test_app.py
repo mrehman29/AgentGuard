@@ -26,6 +26,7 @@ from app.agent_loop import default_model_caller
 from app.main import app, lifespan
 from core import budget_store, guard_core
 from core.config import PROJECT_ROOT, get_settings
+from core.providers import gemini
 from core.schemas import (
     BudgetStatus,
     CommitResult,
@@ -88,7 +89,7 @@ class MemoryTracker:
         self.reservations.append(res_id)
         return res_id
 
-    def commit(self, reservation_id: str, usage: TokenUsage, model=None) -> CommitResult:
+    def commit(self, reservation_id: str, usage: TokenUsage, rates) -> CommitResult:
         self.commits.append((reservation_id, usage))
         return CommitResult(cost_gbp=0.0001, budget=self.check_budget("stub"))
 
@@ -394,7 +395,7 @@ async def test_default_model_caller_disables_afc(monkeypatch):
     captured_config = None
 
     class FakeResponse:
-        candidates = None
+        candidates = [types.Candidate(finish_reason="STOP")]
         usage_metadata = types.GenerateContentResponseUsageMetadata(
             prompt_token_count=45,
             candidates_token_count=20,
@@ -414,16 +415,13 @@ async def test_default_model_caller_disables_afc(monkeypatch):
 
     class FakeAioClient:
         models = FakeAioModels()
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
 
     class FakeGenaiClient:
-        def __init__(self, api_key):
+        def __init__(self, **kwargs):
             self.aio = FakeAioClient()
 
     monkeypatch.setattr(genai, "Client", FakeGenaiClient)
+    monkeypatch.setattr(gemini, "_clients", {})
 
     monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
     settings = get_settings()

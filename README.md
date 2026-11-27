@@ -149,12 +149,20 @@ The classifier and the demo agent can be set separately. All of these are option
 | Variable (`CLASSIFIER_` or `AGENT_` prefix) | Meaning |
 |---|---|
 | `_PROVIDER` | Only `gemini` is available. |
-| `_BASE_URL` | API address. Empty: the provider's default. No credentials, query or fragment. |
+| `_BASE_URL` | API address. Empty: the provider's default. `https`, or `http` for a loopback host only. No credentials, query or fragment. |
 | `_MODEL` | Model name. |
 | `_API_KEY` | API key. Required if the role's URL differs from the one it would otherwise use, so a key is never sent elsewhere. |
-| `_INPUT_COST_PER_1M_USD`, `_OUTPUT_COST_PER_1M_USD` | Rates used to cost this role's calls. Set them when you change the model. |
+| `_INPUT_COST_PER_1M_USD`, `_OUTPUT_COST_PER_1M_USD` | Rates used to cost this role's calls. Both are required if the role's model or URL differs from the one it would otherwise use. |
 | `_TIMEOUT_SEC` | Time limit for a call. |
 | `_MAX_OUTPUT_TOKENS` | Output limit, also the output size reserved. |
+
+Model calls:
+
+- Variables with these prefixes already set in your shell are read too, and override `.env`.
+- Redirects are never followed. `https` calls use the usual proxy and certificate variables (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`); plain `http` calls never go through a proxy.
+- `GOOGLE_GEMINI_BASE_URL`, if set in the process environment, replaces an empty URL and must pass the same rule. Vertex AI variables such as `GOOGLE_GENAI_USE_VERTEXAI` are ignored.
+- The classifier asks Gemini for the thinking level `MINIMAL`. With a model that does not support it, every classification fails and the action is blocked.
+- The demo agent runs a tool call only from a reply that finished normally. An empty reply is an error. Both are still charged. Partial text is shown as it is.
 
 ## Tests
 

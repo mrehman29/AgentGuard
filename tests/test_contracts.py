@@ -221,7 +221,9 @@ def test_api_key_is_not_in_repr(monkeypatch):
 def test_token_cost(monkeypatch):
     for name, value in {"INPUT_COST_PER_1M_USD": "0.30", "OUTPUT_COST_PER_1M_USD": "2.50", "USD_TO_GBP": "0.80"}.items():
         monkeypatch.setenv(name, value)
-    assert token_cost_gbp(get_settings(), 1_000_000, 1_000_000) == pytest.approx(2.24)
+    settings = get_settings()
+    rates = settings.rates_for(settings.classifier)
+    assert token_cost_gbp(rates, 1_000_000, 1_000_000) == pytest.approx(2.24)
 
 
 async def test_cancellation_is_recorded_and_propagates(env):
@@ -271,7 +273,7 @@ async def test_source_and_events_pass_through(env):
         (guard_core.evaluate_action, "tool_name args session_id source label on_event record"),
         (pipeline.execute_guarded, "intent tool_name args session_id provider source label on_event"),
         (budget_store.SessionBudgetTracker.reserve, "self session_id estimate_gbp"),
-        (budget_store.SessionBudgetTracker.commit, "self reservation_id usage model"),
+        (budget_store.SessionBudgetTracker.commit, "self reservation_id usage rates"),
         (budget_store.SessionBudgetTracker.set_session_cap, "self session_id cap_gbp"),
         (budget_store.SessionBudgetTracker.recent_entries, "self limit"),
     ],

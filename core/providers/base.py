@@ -1,7 +1,9 @@
 """The interface every model provider implements.
 
-A provider makes one request per call, with no retries. The caller sets the time
-limit and settles the budget reservation.
+A provider makes one request per call, with no retries and no redirects, and runs
+no tool. The caller sets the time limit, judges the output and settles the budget
+reservation. Text a provider adds to a request must be covered by the caller's
+input reserve.
 """
 
 import re
@@ -51,20 +53,25 @@ class ModelError(Exception):
 
     def __init__(self, kind: str, code: object = None, status: object = None) -> None:
         self.kind = kind if re.fullmatch(r"\w{1,64}", kind) else "Error"
+        self.code = code if isinstance(code, int) else None
+        safe = isinstance(status, str) and re.fullmatch(r"[A-Za-z_ ]{1,64}", status)
+        self.status = status if safe else None
         parts = [self.kind]
         if code is not None or status is not None:
-            safe_code = code if isinstance(code, int) else "unknown"
-            if not (isinstance(status, str) and re.fullmatch(r"[A-Za-z_ ]{1,64}", status)):
-                status = "unknown"
-            parts += [f"code={safe_code}", f"status={status}"]
+            parts += [
+                f"code={'unknown' if self.code is None else self.code}",
+                f"status={self.status or 'unknown'}",
+            ]
         super().__init__(" ".join(parts))
 
 
 class ModelProvider(ABC):
     """Both operations raise ModelError, or TimeoutError, and let cancellation through.
 
-    A reply without token usage is a ModelError. Once usage is known, return a
-    ModelReply even if the output is unusable, so that the call is charged.
+    A reply without token usage is ModelError("MissingUsage"), and one with
+    impossible numbers ModelError("InvalidUsage"). Once usage is known, return a
+    ModelReply even if the output is unusable, so that the call is charged, with
+    nothing awaited between reading the response and returning.
     """
 
     def __init__(self, model: ModelSettings) -> None:

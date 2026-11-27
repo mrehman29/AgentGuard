@@ -3,6 +3,7 @@
 Every estimate (rates, caps, timeouts, reserve sizes) comes from here.
 """
 
+import ipaddress
 import math
 import os
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
+
+from core.schemas import ModelRates
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROVIDER_NAMES = ("gemini",)
@@ -48,6 +51,48 @@ class Settings:
     preset3_session_cap_gbp: float
     preset3_max_steps: int
 
+    def rates_for(self, model: ModelSettings) -> ModelRates:
+        """What prices a call to model. Capture it once, before reserving."""
+        return ModelRates(
+            provider=model.provider,
+            model=model.model,
+            input_cost_per_1m_usd=model.input_cost_per_1m_usd,
+            output_cost_per_1m_usd=model.output_cost_per_1m_usd,
+            usd_to_gbp=self.usd_to_gbp,
+        )
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _check_url(name: str, url: str) -> None:
+    """A model API address: a key is sent to it."""
+    try:
+        parts = urlsplit(url)
+        parts.port  # raises ValueError if it is not a port number
+        valid = (
+            bool(parts.hostname)
+            and (parts.scheme == "https" or (parts.scheme == "http" and _is_loopback(parts.hostname)))
+            and not any(char in parts.netloc for char in "@\\")
+            and not parts.query
+            and not parts.fragment
+            and all("!" <= char <= "~" for char in url)
+        )
+    except ValueError:
+        valid = False
+    # The message must not include the value: it could hold a credential.
+    if not valid:
+        raise ConfigError(
+            f"{name} must be an https URL (http only for a loopback host)"
+            " without credentials, query or fragment"
+        )
+
 
 def get_settings() -> Settings:
     """Return current settings. Real environment variables override .env.
@@ -79,37 +124,16 @@ def get_settings() -> Settings:
             raise ConfigError(f"{name} must be printable ASCII without spaces")
         return key
 
-    def _base_url(name: str) -> str:
-        url = _text(name, "")
-        if not url:
-            return ""
-        try:
-            parts = urlsplit(url)
-            parts.port  # raises ValueError if it is not a port number
-            valid = (
-                parts.scheme in ("http", "https")
-                and parts.hostname
-                and "@" not in parts.netloc
-                and not parts.query
-                and not parts.fragment
-                and all("!" <= char <= "~" for char in url)
-            )
-        except ValueError:
-            valid = False
-        # The message must not include the value: it could hold a credential.
-        if not valid:
-            raise ConfigError(
-                f"{name} must be an http or https URL without credentials, query or fragment"
-            )
-        return url
-
     def _model(role: str, fallback: ModelSettings) -> ModelSettings:
         """The role's own settings, each falling back to the fallback's."""
         provider = _text(f"{role}_PROVIDER", fallback.provider).lower()
         if provider not in PROVIDER_NAMES:
             raise ConfigError(f"{role}_PROVIDER must be one of: {', '.join(PROVIDER_NAMES)}")
         same_provider = provider == fallback.provider
-        base_url = _base_url(f"{role}_BASE_URL") or (fallback.base_url if same_provider else "")
+        own_url = _text(f"{role}_BASE_URL", "")
+        if own_url:
+            _check_url(f"{role}_BASE_URL", own_url)
+        base_url = own_url or (fallback.base_url if same_provider else "")
         model = _text(f"{role}_MODEL", fallback.model if same_provider else "")
         if not model:
             raise ConfigError(f"{role}_MODEL must be set for this provider")
@@ -119,6 +143,17 @@ def get_settings() -> Settings:
             if not same_provider or base_url != fallback.base_url:
                 raise ConfigError(f"{role}_API_KEY must be set for a different provider or URL")
             api_key = fallback.api_key
+        # Rates set for another model or endpoint could under-charge this one.
+        if (provider, base_url, model) != (fallback.provider, fallback.base_url, fallback.model):
+            for name in ("INPUT_COST_PER_1M_USD", "OUTPUT_COST_PER_1M_USD"):
+                if not _text(f"{role}_{name}", ""):
+                    raise ConfigError(
+                        f"{role}_{name} must be set for a different model, provider or URL"
+                    )
+        # With no URL of its own, the Gemini SDK would use this process variable.
+        sdk_url = os.environ.get("GOOGLE_GEMINI_BASE_URL", "")
+        if provider == "gemini" and not base_url and sdk_url:
+            _check_url("GOOGLE_GEMINI_BASE_URL", sdk_url)
         return ModelSettings(
             provider=provider,
             base_url=base_url,
@@ -167,15 +202,9 @@ def get_settings() -> Settings:
     )
 
 
-def token_cost_gbp(
-    settings: Settings,
-    input_tokens: int,
-    output_tokens: int,
-    model: ModelSettings | None = None,
-) -> float:
-    """Cost of a call to model (default: the classifier's). Output includes thought tokens."""
-    rates = model or settings.classifier
+def token_cost_gbp(rates: ModelRates, input_tokens: int, output_tokens: int) -> float:
+    """Cost of a model call. output_tokens includes thought tokens."""
     usd = (
         input_tokens * rates.input_cost_per_1m_usd + output_tokens * rates.output_cost_per_1m_usd
     ) / 1_000_000
-    return usd * settings.usd_to_gbp
+    return usd * rates.usd_to_gbp

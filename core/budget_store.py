@@ -12,8 +12,8 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from core.config import ModelSettings, get_settings, token_cost_gbp
-from core.schemas import BudgetStatus, CommitResult, LedgerEntry, TokenUsage
+from core.config import get_settings, token_cost_gbp
+from core.schemas import BudgetStatus, CommitResult, LedgerEntry, ModelRates, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -161,28 +161,21 @@ class SessionBudgetTracker:
             )
             return reservation_id
 
-    def commit(
-        self, reservation_id: str, usage: TokenUsage, model: ModelSettings | None = None
-    ) -> CommitResult:
+    def commit(self, reservation_id: str, usage: TokenUsage, rates: ModelRates) -> CommitResult:
         """Replace a reservation with the actual cost. Unknown id: KeyError.
 
-        The cost is at the rates of the model called (default: the classifier's).
+        rates are those of the model called.
         A database error is retried once, so a billed call is not lost to it.
         """
         try:
-            return self._commit(reservation_id, usage, model)
+            return self._commit(reservation_id, usage, rates)
         except sqlite3.Error:
             logger.warning("commit failed; retrying once")
-            return self._commit(reservation_id, usage, model)
+            return self._commit(reservation_id, usage, rates)
 
-    def _commit(
-        self, reservation_id: str, usage: TokenUsage, model: ModelSettings | None
-    ) -> CommitResult:
+    def _commit(self, reservation_id: str, usage: TokenUsage, rates: ModelRates) -> CommitResult:
         cost = token_cost_gbp(
-            get_settings(),
-            usage.prompt_tokens,
-            usage.candidates_tokens + usage.thoughts_tokens,
-            model,
+            rates, usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
         )
         with self._transaction() as db:
             row = db.execute(

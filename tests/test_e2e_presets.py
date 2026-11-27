@@ -84,7 +84,9 @@ def free_port() -> int:
 
 def unit_cost() -> float:
     """Cost of one fake model call."""
-    return token_cost_gbp(get_settings(), PROMPT_TOKENS, CANDIDATE_TOKENS + THOUGHT_TOKENS)
+    settings = get_settings()
+    rates = settings.rates_for(settings.classifier)
+    return token_cost_gbp(rates, PROMPT_TOKENS, CANDIDATE_TOKENS + THOUGHT_TOKENS)
 
 
 # --- the fake model ---
@@ -256,7 +258,7 @@ def env(monkeypatch, tmp_path, model, worker_url):
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(core.config, "dotenv_values", lambda *args, **kwargs: {})
     monkeypatch.setattr(budget_store, "_tracker", None)
-    monkeypatch.setattr(gemini, "_client_cache", None)
+    monkeypatch.setattr(gemini, "_clients", {})
     monkeypatch.setattr(docker_provider, "_swept", True)
     monkeypatch.setattr("sandbox.cloudrun_provider._cached_token", None)
 

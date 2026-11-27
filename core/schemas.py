@@ -47,7 +47,9 @@ Outcome = Literal[
 
 
 class OwaspVerdict(Frozen):
-    """The only schema sent to the classifier model."""
+    """The only model schema sent to Gemini."""
+
+    # The docstring above is sent to the model, as the schema's description.
 
     decision: Decision
     risk_score: int = Field(ge=0, le=100)
@@ -63,9 +65,21 @@ class GuardEvaluation(OwaspVerdict):
 
 
 class TokenUsage(Frozen):
+    """candidates_tokens excludes reasoning: output is billed as it plus thoughts."""
+
     prompt_tokens: int = Field(default=0, ge=0)
     candidates_tokens: int = Field(default=0, ge=0)
     thoughts_tokens: int = Field(default=0, ge=0)
+
+
+class ModelRates(Frozen):
+    """The estimates that price one model's calls."""
+
+    provider: str
+    model: str
+    input_cost_per_1m_usd: float = Field(gt=0, allow_inf_nan=False)
+    output_cost_per_1m_usd: float = Field(gt=0, allow_inf_nan=False)
+    usd_to_gbp: float = Field(gt=0, allow_inf_nan=False)
 
 
 class BudgetStatus(Frozen):

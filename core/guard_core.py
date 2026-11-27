@@ -359,11 +359,12 @@ async def _classify(
         model = settings.classifier
         if not model.api_key:
             return fail("Guard error: no model API key is configured.")
+        rates = settings.rates_for(model)
         payload = json.dumps({"tool_name": tool_name, "args": args}, ensure_ascii=False)
         # The configured size covers the instructions and schema. A token is at
         # least one byte, so the payload's byte count bounds the rest.
         input_tokens = settings.budget_reserve_input_tokens + len(payload.encode())
-        estimate = token_cost_gbp(settings, input_tokens, model.max_output_tokens, model)
+        estimate = token_cost_gbp(rates, input_tokens, model.max_output_tokens)
         tracker = budget_store.get_tracker()
         reservation = tracker.reserve(session_id, estimate)
         if reservation is None:
@@ -377,7 +378,7 @@ async def _classify(
         async with asyncio.timeout(model.timeout_sec):
             reply = await get_provider(model).classify(SYSTEM_INSTRUCTION, payload, OwaspVerdict)
         # Charge for the call before judging its output: bad output still costs.
-        cost = tracker.commit(reservation, reply.usage, model).cost_gbp
+        cost = tracker.commit(reservation, reply.usage, rates).cost_gbp
         reservation = None
         verdict = _parse_verdict(reply)
         if verdict.decision is Decision.ALLOW:

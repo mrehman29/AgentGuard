@@ -15,7 +15,7 @@ from typing import Any
 from core import budget_store, guard_core
 from core.config import Settings, get_settings, token_cost_gbp
 from core.pipeline import execute_guarded
-from core.providers import ToolSpec, get_provider
+from core.providers import ModelError, ToolSpec, get_provider
 from core.schemas import (
     Decision,
     GuardEvaluation,
@@ -67,7 +67,8 @@ async def default_model_caller(
     """One turn of the agent's model. Proposed tools are not run here.
 
     Returns (TokenUsage, optional_text_reply, optional_tool_call). Both optional
-    values are None if the output cannot be used.
+    values are None if the output cannot be used: a tool call is only accepted
+    from a finished reply, with a name and an object of arguments.
     """
     _validate_text(prompt, "prompt")
     # Not wait_for: on Python 3.11 it can swallow a cancel.
@@ -76,9 +77,12 @@ async def default_model_caller(
             SYSTEM_INSTRUCTION, prompt, [EXECUTE_PYTHON]
         )
     call = reply.tool_call
-    if call is not None:
+    if call is None:
+        return reply.usage, reply.text, None
+    named = isinstance(call.name, str) and call.name.strip()
+    if reply.finished and named and isinstance(call.args, dict):
         return reply.usage, None, {"tool_name": call.name, "args": call.args}
-    return reply.usage, reply.text, None
+    return reply.usage, None, None
 
 
 # Injectable/monkeypatchable caller for testing
@@ -278,16 +282,12 @@ async def _run_standard_workflow(
 
     # Agent model turn
     budget_before = tracker.check_budget(active_session)
+    rates = settings.rates_for(settings.agent)
     estimated_input_tokens = max(
         len(prompt.encode("utf-8", "replace")) // 4 + 100,
         settings.budget_reserve_input_tokens,
     )
-    reserve_cost = token_cost_gbp(
-        settings,
-        estimated_input_tokens,
-        settings.agent.max_output_tokens,
-        settings.agent,
-    )
+    reserve_cost = token_cost_gbp(rates, estimated_input_tokens, settings.agent.max_output_tokens)
     reservation_id = tracker.reserve(active_session, reserve_cost)
 
     if reservation_id is None:
@@ -353,10 +353,10 @@ async def _run_standard_workflow(
     committed = False
     try:
         usage, text_reply, tool_call = await model_caller(prompt, settings)
-        commit_res = tracker.commit(reservation_id, usage, settings.agent)
+        commit_res = tracker.commit(reservation_id, usage, rates)
         committed = True
         # Charged either way: unusable output still costs.
-        unusable = text_reply is None and not tool_call
+        unusable = not tool_call and not (text_reply or "").strip()
         tracker.record(
             LedgerEntry(
                 time=datetime.now(UTC),
@@ -368,6 +368,13 @@ async def _run_standard_workflow(
             )
         )
     except BaseException as exc:
+        # Safe to log: a ModelError holds no message, and only types otherwise.
+        if isinstance(exc, ModelError):
+            logger.warning("agent model call failed: %s", exc)
+        elif isinstance(exc, TimeoutError):
+            logger.warning("agent model call timed out")
+        elif not isinstance(exc, asyncio.CancelledError):
+            logger.warning("agent turn failed: %s", type(exc).__name__)
         if not committed:
             try:
                 tracker.release(reservation_id)
