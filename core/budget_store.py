@@ -4,6 +4,7 @@ Spend is reserved before a model call, then committed with the actual usage or
 released. Signatures, including get_tracker(), are frozen.
 """
 
+import logging
 import math
 import sqlite3
 import time
@@ -13,6 +14,8 @@ from contextlib import contextmanager
 
 from core.config import get_settings, token_cost_gbp
 from core.schemas import BudgetStatus, CommitResult, LedgerEntry, TokenUsage
+
+logger = logging.getLogger(__name__)
 
 BUSY_TIMEOUT_MS = 5000
 # A reservation left by a process that died stops counting after this many
@@ -157,7 +160,17 @@ class SessionBudgetTracker:
             return reservation_id
 
     def commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
-        """Replace a reservation with the actual cost. Unknown id: KeyError."""
+        """Replace a reservation with the actual cost. Unknown id: KeyError.
+
+        A database error is retried once, so a billed call is not lost to it.
+        """
+        try:
+            return self._commit(reservation_id, usage)
+        except sqlite3.Error:
+            logger.warning("commit failed; retrying once")
+            return self._commit(reservation_id, usage)
+
+    def _commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
         cost = token_cost_gbp(
             get_settings(), usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
         )

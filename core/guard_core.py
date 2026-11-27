@@ -14,11 +14,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from core import budget_store
 from core.config import Settings, get_settings, token_cost_gbp
 from core.schemas import (
+    MAX_CODE_CHARS,
     BudgetStatus,
     Decision,
     GuardEvaluation,
@@ -69,12 +70,19 @@ short sentence.
 
 # Separator between a command and its arguments, in shell text or an argv list.
 _SEP = r"[\s\"',]+"
-# Any options before the one being looked for.
-_OPTIONS = rf"(?:{_SEP}-[a-z-]+){{0,6}}?{_SEP}"
+# Anything before the rm flag being looked for: options, or operands on the same
+# line of the same command. Stopping at the next "rm" keeps the search linear.
+_OPERAND = r"[ \t\"',]+(?!rm\b)[^\s\"',;|&#-][^\s\"',;|&]*"
+_BEFORE_FLAG = rf"(?:{_SEP}-[a-z-]+|{_OPERAND}){{0,6}}?{_SEP}"
 _NETWORK_MODULES = (
     "socket", "requests", "urllib", "urllib3", "httpx", "aiohttp",
     "http.client", "ftplib", "smtplib", "telnetlib", "paramiko",
 )
+_MODULE_PATTERNS = {
+    # Not urllib.parse, which does no I/O.
+    "urllib": r"urllib(?!\.parse\b|[ \t]+import[ \t]+parse[ \t]*(?:$|[#;]))",
+}
+_NETWORK_IMPORTS = "|".join(_MODULE_PATTERNS.get(m, re.escape(m)) for m in _NETWORK_MODULES)
 
 
 def _imports(modules: str) -> str:
@@ -91,6 +99,13 @@ def _sig(pattern: str, *triggers: str) -> tuple[tuple[str, ...], re.Pattern[str]
     return triggers, re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
+# A verb, then up to six other words. Matching whole words keeps the search fast.
+_BETWEEN = r"[\s,'\"-]++"
+_OVERRIDE_VERB = (
+    rf"\b(?:ignore|disregard|forget|override|bypass)\b(?:{_BETWEEN}\w++){{0,6}}?{_BETWEEN}"
+)
+_OVERRIDE_NOUN = r"\b(?:instructions?|rules?|prompts?|guidelines?|polic(?:y|ies))\b"
+
 _FROM_OS = r"\bfrom[ \t]+os[ \t]+import\b(?:[ \t]*\([^)]{0,200}?|[^\n#;(]{0,200}?)"
 
 # Checked in order; the first hit decides. A cheap pre-filter, not a boundary.
@@ -100,10 +115,16 @@ _RULES = (
         OwaspTag.LLM01,
         (
             _sig(r"\bsystem[\s_-]{0,3}override\b", "override"),
+            # "ignore all previous instructions", "ignore the instructions above"
+            # and "ignore the rules you were given", in one pass over the text.
             _sig(
-                r"\b(?:ignore|disregard|forget|override|bypass)\b[\s\w,'\"-]{0,40}?"
-                r"\b(?:previous|prior|above|earlier|all|your|system|safety)\b[\s\w-]{0,20}?"
-                r"\b(?:instructions?|rules?|prompts?|guidelines?|polic(?:y|ies))\b",
+                _OVERRIDE_VERB
+                + r"(?:(?:previous|prior|above|earlier|all|any|your|system|safety)\b"
+                + rf"(?:{_BETWEEN}\w++){{0,2}}?{_BETWEEN}"
+                + _OVERRIDE_NOUN
+                + r"|"
+                + _OVERRIDE_NOUN
+                + r"\s{1,5}(?:above\b|you\s{1,5}(?:were|have\s{1,5}been)\s{1,5}(?:given|told)\b))",
                 "instruction", "rule", "prompt", "guideline", "polic",
             ),
         ),
@@ -114,8 +135,8 @@ _RULES = (
         (
             # rm with both recursive and force flags, in any order or grouping.
             _sig(
-                rf"\brm\b(?={_OPTIONS}(?:-[a-z]*r|--recursive\b))"
-                rf"(?={_OPTIONS}(?:-[a-z]*f|--force\b))",
+                rf"\brm\b(?={_BEFORE_FLAG}(?:-[a-z]*r|--recursive\b))"
+                rf"(?={_BEFORE_FLAG}(?:-[a-z]*f|--force\b))",
                 "rm",
             ),
             _sig(r"\brmtree\s*\(", "rmtree"),
@@ -137,7 +158,8 @@ _RULES = (
             _sig(r"\.aws/credentials\b", ".aws/"),
             _sig(r"\.git-credentials\b", ".git-credentials"),
             _sig(r"\bapplication_default_credentials\b", "application_default"),
-            _sig(r"(?<![\w.])\.env\b", ".env"),
+            _sig(r"(?<![\w.])\.env\b(?!\.example(?![\w-]|\.\w))", ".env"),
+            _sig(r"\bfrom[ \t]+os[ \t]+import\b[ \t]*\(?\s{0,20}\*", "*"),
             _sig(r"\bos\s*\.\s*(?:environb?|getenvb?|putenv)\b", "environ", "getenv", "putenv"),
             _sig(_FROM_OS + r"\b(?:environb?|getenvb?)\b", "environ", "getenv"),
         ),
@@ -146,8 +168,8 @@ _RULES = (
         "dynamic execution",
         OwaspTag.LLM06,
         (
-            # Not retrieval(x) or model.eval().
-            _sig(r"(?<![\w.])(?:eval|exec)\s*\(", "eval", "exec"),
+            # Not retrieval(x), model.eval() or a method definition.
+            _sig(r"(?<![\w.])(?<!\bdef[ \t])(?:eval|exec)\s*\(", "eval", "exec"),
             _sig(r"\bbuiltins\s*\.\s*(?:eval|exec)\b", "builtins"),
             _sig(r"\b__import__\s*\(", "__import__"),
             _sig(r"\bos\s*\.\s*(?:system|popen|exec[lv]p?e?|spawn[lv]p?e?)\s*\(", "os"),
@@ -164,7 +186,7 @@ _RULES = (
         "network access",
         OwaspTag.LLM06,
         (
-            _sig(_imports("|".join(map(re.escape, _NETWORK_MODULES))), *_NETWORK_MODULES),
+            _sig(_imports(_NETWORK_IMPORTS), *_NETWORK_MODULES),
             _sig(
                 r"\b(?:curl|wget)[ \t]+(?:-{1,2}[a-z]|(?:https?|ftp)://|[\w-]+\.[a-z]{2,}\b)",
                 "curl", "wget",
@@ -177,7 +199,9 @@ _RULES = (
         ),
     ),
 )
-_INVISIBLE = dict.fromkeys(map(ord, "­​‌‍⁠﻿"))
+# Room for the largest code request after normalisation. Longer text is blocked.
+MAX_SCREENED_CHARS = MAX_CODE_CHARS + 1024
+_NORMALISE_CHUNK = 512
 
 
 def _strings(value: Any) -> list[str]:
@@ -199,25 +223,51 @@ def _strings(value: Any) -> list[str]:
     return found
 
 
+def _normalise(text: str) -> str | None:
+    """NFKC without format characters, or None if it is too long to screen.
+
+    Works in chunks, so text that expands greatly is abandoned early.
+    """
+    parts: list[str] = []
+    length = 0
+    for offset in range(0, len(text), _NORMALISE_CHUNK):
+        part = unicodedata.normalize("NFKC", text[offset : offset + _NORMALISE_CHUNK])
+        length += len(part)
+        if length > MAX_SCREENED_CHARS:
+            return None
+        parts.append(part)
+    joined = "".join(parts)
+    formats = {ord(char): None for char in set(joined) if unicodedata.category(char) == "Cf"}
+    return joined.translate(formats)
+
+
+def _regex_block(tag: OwaspTag, reason: str, start: float) -> GuardEvaluation:
+    return GuardEvaluation(
+        decision=Decision.BLOCK,
+        risk_score=100,
+        owasp_tag=tag,
+        reason=reason,
+        stage=Stage.REGEX,
+        latency_ms=_elapsed_ms(start),
+        gates_passed=[Stage.BUDGET],
+    )
+
+
 def fast_rule_check(tool_name: str, args: dict) -> GuardEvaluation | None:
     """Signature rules over the arguments. No model call."""
     start = time.perf_counter()
-    text = unicodedata.normalize("NFKC", "\n".join(_strings(args))).translate(_INVISIBLE)
+    text = _normalise("\n".join(_strings(args)))
+    if text is None:
+        return _regex_block(OwaspTag.NA, "The arguments are too long to screen.", start)
+    # Backslash continuations: one logical line.
+    text = text.replace("\\\r\n", " ").replace("\\\n", " ")
     folded = text.casefold()
     for name, tag, signatures in _RULES:
         if any(
             any(trigger in folded for trigger in triggers) and pattern.search(text)
             for triggers, pattern in signatures
         ):
-            return GuardEvaluation(
-                decision=Decision.BLOCK,
-                risk_score=100,
-                owasp_tag=tag,
-                reason=f"Matched a signature rule: {name}.",
-                stage=Stage.REGEX,
-                latency_ms=_elapsed_ms(start),
-                gates_passed=[Stage.BUDGET],
-            )
+            return _regex_block(tag, f"Matched a signature rule: {name}.", start)
     return None
 
 
@@ -249,8 +299,11 @@ def _token_usage(response: Any) -> TokenUsage:
     )
 
 
-def _parse_verdict(text: str | None) -> OwaspVerdict:
-    verdict = OwaspVerdict.model_validate_json(text or "")
+def _parse_verdict(response: Any) -> OwaspVerdict:
+    candidates = response.candidates
+    if not candidates or candidates[0].finish_reason != types.FinishReason.STOP:
+        raise ValueError("the model did not finish normally")
+    verdict = OwaspVerdict.model_validate_json(response.text or "")
     safe = verdict.owasp_tag is OwaspTag.SAFE
     if verdict.owasp_tag is OwaspTag.NA or safe != (verdict.decision is Decision.ALLOW):
         raise ValueError("the decision and tag disagree")
@@ -281,6 +334,30 @@ def _budget_block(reason: str, gates_passed: list[Stage], start: float) -> Guard
         stage=Stage.BUDGET,
         latency_ms=_elapsed_ms(start),
         gates_passed=gates_passed,
+    )
+
+
+def _api_error_details(exc: Exception) -> str:
+    """The numeric code and status name of an API error, never its message."""
+    if not isinstance(exc, errors.APIError):
+        return ""
+    code = exc.code if isinstance(exc.code, int) else "unknown"
+    status = exc.status
+    if not (isinstance(status, str) and re.fullmatch(r"[A-Za-z_ ]{1,64}", status)):
+        status = "unknown"
+    return f" code={code} status={status}"
+
+
+def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
+    budget_store.get_tracker().record(
+        LedgerEntry(
+            time=datetime.now(UTC),
+            source=source,
+            session_id=session_id,
+            label=label,
+            outcome=ledger_outcome(guard),
+            cost_gbp=guard.cost_gbp,
+        )
     )
 
 
@@ -318,13 +395,13 @@ async def _classify(
         if on_event is not None:
             on_event("budget_reserved", tracker.check_budget(session_id))
 
-        response = await asyncio.wait_for(
-            _call_model(settings, payload), settings.classifier_timeout_sec
-        )
+        # Not wait_for: on Python 3.11 it can swallow a cancel.
+        async with asyncio.timeout(settings.classifier_timeout_sec):
+            response = await _call_model(settings, payload)
         # Charge for the call before judging its output: bad output still costs.
         cost = tracker.commit(reservation, _token_usage(response)).cost_gbp
         reservation = None
-        verdict = _parse_verdict(response.text)
+        verdict = _parse_verdict(response)
         if verdict.decision is Decision.ALLOW:
             passed.append(Stage.OWASP_LLM)
         return GuardEvaluation(
@@ -339,7 +416,7 @@ async def _classify(
         return fail("Guard error: the classifier timed out.")
     except Exception as exc:
         # The type only: messages can echo arguments or request details.
-        logger.warning("classifier failed: %s", type(exc).__name__)
+        logger.warning("classifier failed: %s%s", type(exc).__name__, _api_error_details(exc))
         return fail(f"Guard error: classifier failed ({type(exc).__name__}).")
     finally:
         # Also runs on cancellation, so no reservation is left behind.
@@ -377,6 +454,15 @@ async def evaluate_action(
             if guard is None:
                 passed.append(Stage.REGEX)
                 guard = await _classify(tool_name, args, session_id, on_event)
+    except asyncio.CancelledError:
+        # With record=False the caller records it.
+        if record:
+            cancelled = error_block("Guard error: cancelled.", passed, _elapsed_ms(start))
+            try:
+                _record(session_id, source, label, cancelled)
+            except Exception:
+                logger.exception("ledger update failed")
+        raise
     except Exception as exc:
         logger.warning("guard failed: %s", type(exc).__name__)
         guard = error_block(
@@ -384,16 +470,7 @@ async def evaluate_action(
         )
     if record:
         try:
-            budget_store.get_tracker().record(
-                LedgerEntry(
-                    time=datetime.now(UTC),
-                    source=source,
-                    session_id=session_id,
-                    label=label,
-                    outcome=ledger_outcome(guard),
-                    cost_gbp=guard.cost_gbp,
-                )
-            )
+            _record(session_id, source, label, guard)
         except Exception:
             logger.exception("ledger update failed")
             guard = error_block(
