@@ -1,4 +1,4 @@
-"""Sandbox providers (Track B). Phase 0 stubs execute nothing."""
+"""Sandbox provider registry (Track B)."""
 
 from core.config import get_settings
 from sandbox.base import SandboxProvider
