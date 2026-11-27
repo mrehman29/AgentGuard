@@ -13,6 +13,7 @@ from google.genai import errors, types
 
 from core import budget_store, guard_core, pipeline
 from core.config import PROJECT_ROOT, get_settings, token_cost_gbp
+from core.providers import gemini
 from core.schemas import Decision, LedgerEntry, OwaspTag, Stage, TokenUsage
 
 USAGE = TokenUsage(prompt_tokens=400, candidates_tokens=60, thoughts_tokens=20)
@@ -44,8 +45,13 @@ def tracker():
     return budget_store.get_tracker()
 
 
+def rates():
+    settings = get_settings()
+    return settings.rates_for(settings.classifier)
+
+
 def spend(tracker, session_id="demo", usage=USAGE):
-    return tracker.commit(tracker.reserve(session_id, 0.001), usage)
+    return tracker.commit(tracker.reserve(session_id, 0.001), usage, rates())
 
 
 def entry(label="screen", cost=0.0):
@@ -60,7 +66,7 @@ def entry(label="screen", cost=0.0):
 
 def test_commit_charges_thoughts_as_output(tracker):
     result = spend(tracker)
-    assert result.cost_gbp == pytest.approx(token_cost_gbp(get_settings(), 400, 80))
+    assert result.cost_gbp == pytest.approx(token_cost_gbp(rates(), 400, 80))
     status = result.budget
     assert (status.prompt_tokens, status.candidates_tokens, status.thoughts_tokens) == (400, 60, 20)
     assert status.total_tokens == 480
@@ -73,7 +79,7 @@ def test_commit_charges_thoughts_as_output(tracker):
 def test_commit_uses_the_reservations_session(tracker):
     first = tracker.reserve("a", 0.001)
     tracker.reserve("b", 0.001)
-    assert tracker.commit(first, USAGE).budget.session_id == "a"
+    assert tracker.commit(first, USAGE, rates()).budget.session_id == "a"
     assert tracker.check_budget("a").spent_gbp > 0
     assert tracker.check_budget("b").spent_gbp == 0
 
@@ -81,12 +87,12 @@ def test_commit_uses_the_reservations_session(tracker):
 def test_reservation_is_settled_once(tracker):
     reservation = tracker.reserve("demo", 0.001)
     assert tracker.check_budget("demo").reserved_gbp == pytest.approx(0.001)
-    tracker.commit(reservation, USAGE)
+    tracker.commit(reservation, USAGE, rates())
     with pytest.raises(KeyError):
-        tracker.commit(reservation, USAGE)
+        tracker.commit(reservation, USAGE, rates())
     tracker.release(reservation)
     assert tracker.check_budget("demo").spent_gbp == pytest.approx(
-        token_cost_gbp(get_settings(), 400, 80)
+        token_cost_gbp(rates(), 400, 80)
     )
 
 
@@ -105,7 +111,7 @@ def test_abandoned_reservation_expires(tracker, monkeypatch):
     monkeypatch.setattr(budget_store.time, "time", lambda: later)
     assert tracker.check_budget("demo").reserved_gbp == 0
     assert tracker.reserve("demo", 0.001) is not None
-    assert tracker.commit(reservation, USAGE).cost_gbp > 0  # a late call is still charged
+    assert tracker.commit(reservation, USAGE, rates()).cost_gbp > 0  # a late call is still charged
 
 
 def test_cap_can_only_be_lowered(tracker):
@@ -138,7 +144,7 @@ def test_reset_clears_one_session_and_keeps_global(tracker):
     assert status.reserved_gbp == pytest.approx(0.001)
     assert status.global_spent_gbp == pytest.approx(2 * cost)
     assert tracker.check_budget("loop-1").spent_gbp == pytest.approx(cost)
-    assert tracker.commit(pending, USAGE).budget.spent_gbp == pytest.approx(cost)
+    assert tracker.commit(pending, USAGE, rates()).budget.spent_gbp == pytest.approx(cost)
 
 
 def test_new_session_cannot_pass_the_global_cap(tracker, monkeypatch):
@@ -178,7 +184,8 @@ def _spend_many(count, results):
     for _ in range(count):
         reservation = tracker.reserve("shared", 0.001)
         if reservation:
-            tracker.commit(reservation, TokenUsage(prompt_tokens=100, candidates_tokens=10))
+            usage = TokenUsage(prompt_tokens=100, candidates_tokens=10)
+            tracker.commit(reservation, usage, rates())
             committed += 1
     results.put(committed)
 
@@ -205,7 +212,7 @@ def test_two_processes_sum_correctly():
     assert _run_processes(_spend_many, 2, 40) == 80
     status = budget_store.get_tracker().check_budget("shared")
     assert status.prompt_tokens == 8000
-    assert status.spent_gbp == pytest.approx(80 * token_cost_gbp(get_settings(), 100, 10))
+    assert status.spent_gbp == pytest.approx(80 * token_cost_gbp(rates(), 100, 10))
     assert status.reserved_gbp == 0
 
 
@@ -484,12 +491,12 @@ def model(monkeypatch):
         return state.response
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
-    monkeypatch.setattr(guard_core, "_make_client", lambda settings: client)
+    monkeypatch.setattr(gemini, "_client", lambda api_key, base_url: client)
     return state
 
 
 def actual_cost():
-    return token_cost_gbp(get_settings(), 400, 80)
+    return token_cost_gbp(rates(), 400, 80)
 
 
 def assert_nothing_reserved(session_id="demo"):
@@ -645,7 +652,7 @@ async def test_cancel_as_the_reply_arrives_is_not_swallowed(monkeypatch, tracker
         return await pending
 
     client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate_content)))
-    monkeypatch.setattr(guard_core, "_make_client", lambda settings: client)
+    monkeypatch.setattr(gemini, "_client", lambda api_key, base_url: client)
     ran = []
 
     class Provider:
@@ -805,7 +812,7 @@ async def test_large_arguments_reserve_more(model, tracker):
             "execute_python", {"code": code}, "demo",
             on_event=lambda _, status: reserved.append(status.reserved_gbp),
         )
-    assert reserved[1] - reserved[0] > token_cost_gbp(get_settings(), 17_000, 0)
+    assert reserved[1] - reserved[0] > token_cost_gbp(rates(), 17_000, 0)
 
 
 async def test_concurrent_actions_cannot_pass_the_cap(model, tracker):

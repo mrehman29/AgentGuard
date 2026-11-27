@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.mcp_server import mcp
+from core.config import get_settings
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -20,4 +21,5 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    get_settings()  # a bad setting stops the server here, with its name
     mcp.run(transport="stdio")

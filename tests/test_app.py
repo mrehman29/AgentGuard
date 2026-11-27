@@ -25,7 +25,8 @@ from app import agent_loop
 from app.agent_loop import default_model_caller
 from app.main import app, lifespan
 from core import budget_store, guard_core
-from core.config import PROJECT_ROOT, Settings, get_settings
+from core.config import PROJECT_ROOT, get_settings
+from core.providers import gemini
 from core.schemas import (
     BudgetStatus,
     CommitResult,
@@ -88,7 +89,7 @@ class MemoryTracker:
         self.reservations.append(res_id)
         return res_id
 
-    def commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
+    def commit(self, reservation_id: str, usage: TokenUsage, rates) -> CommitResult:
         self.commits.append((reservation_id, usage))
         return CommitResult(cost_gbp=0.0001, budget=self.check_budget("stub"))
 
@@ -394,6 +395,7 @@ async def test_default_model_caller_disables_afc(monkeypatch):
     captured_config = None
 
     class FakeResponse:
+        candidates = [types.Candidate(finish_reason="STOP")]
         usage_metadata = types.GenerateContentResponseUsageMetadata(
             prompt_token_count=45,
             candidates_token_count=20,
@@ -413,35 +415,16 @@ async def test_default_model_caller_disables_afc(monkeypatch):
 
     class FakeAioClient:
         models = FakeAioModels()
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
 
     class FakeGenaiClient:
-        def __init__(self, api_key):
+        def __init__(self, **kwargs):
             self.aio = FakeAioClient()
 
     monkeypatch.setattr(genai, "Client", FakeGenaiClient)
+    monkeypatch.setattr(gemini, "_clients", {})
 
-    settings = Settings(
-        gemini_api_key="fake-key",
-        gemini_model="gemini-3.5-flash-lite",
-        input_cost_per_1m_usd=0.30,
-        output_cost_per_1m_usd=2.50,
-        usd_to_gbp=0.80,
-        session_budget_cap_gbp=0.05,
-        global_budget_cap_gbp=0.50,
-        sandbox_provider="docker",
-        sandbox_docker_image="agentguard-sandbox:latest",
-        cloudrun_sandbox_url="",
-        sqlite_db_path=PROJECT_ROOT / "data/guard_state.db",
-        classifier_timeout_sec=5.0,
-        budget_reserve_input_tokens=610,
-        budget_reserve_output_tokens=512,
-        preset3_session_cap_gbp=0.002,
-        preset3_max_steps=6,
-    )
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    settings = get_settings()
 
     usage, text, tool_call = await default_model_caller("Calculate 6*7", settings)
 
