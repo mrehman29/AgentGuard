@@ -87,11 +87,15 @@ _MODULE_PATTERNS = {
 _NETWORK_IMPORTS = "|".join(_MODULE_PATTERNS.get(m, re.escape(m)) for m in _NETWORK_MODULES)
 
 
+# Where a statement can start.
+_STATEMENT_START = r"(?:^|[;:])"
+
+
 def _imports(modules: str) -> str:
     """An import statement of one of the modules, not prose that mentions it."""
     earlier = r"(?:[\w.]+(?:[ \t]+as[ \t]+\w+)?[ \t]*,[ \t]*){0,10}"
     return (
-        rf"(?:^|[;:])[ \t]*(?:import[ \t]+{earlier}(?:{modules})\b"
+        rf"{_STATEMENT_START}[ \t]*(?:import[ \t]+{earlier}(?:{modules})\b"
         rf"|from[ \t]+(?:{modules})(?:\.\w+)*[ \t]+import\b)"
     )
 
@@ -195,7 +199,8 @@ _RULES = (
             ),
             _sig(r"\brequests\s*\.\s*(?:get|post|put|patch|delete|head|request)\s*\(", "requests"),
             _sig(r"\burlopen\s*\(", "urlopen"),
-            _sig(r"\burllib\s*\.\s*request\s*\.\s*\w", "urllib"),
+            # The name follows the dot directly, so a sentence ending there passes.
+            _sig(r"\burllib\s*\.\s*request\s*\.(?:\\\n[ \t]*)?\w", "urllib"),
             _sig(r"\bsocket\s*\.\s*(?:socket|create_connection)\s*\(", "socket"),
             _sig(r"/dev/tcp/", "/dev/tcp/"),
             _sig(r"\bnc[ \t]+-[a-z]*e\b", "nc"),
@@ -256,21 +261,42 @@ def _regex_block(tag: OwaspTag, reason: str, start: float) -> GuardEvaluation:
     )
 
 
+def _join_continuations(text: str) -> str:
+    return text.replace("\\\n", " ")
+
+
+def _versions(text: str) -> list[tuple[str, str, bool]]:
+    """The texts to screen: each with its casefolded form, and whether only the
+    signatures anchored to the start of a statement need it.
+    """
+    joined = _join_continuations(text)
+    # Python does not continue a comment. Drop a comment's final backslash before
+    # joining, so that a continued statement below it still starts a line.
+    uncommented = _join_continuations(
+        "\n".join(line.rstrip("\\") if "#" in line else line for line in text.split("\n"))
+    )
+    found = [(text, False)]
+    if joined != text:
+        found.append((joined, False))
+    if uncommented not in (text, joined):
+        found.append((uncommented, True))
+    return [(version, version.casefold(), anchored) for version, anchored in found]
+
+
 def fast_rule_check(tool_name: str, args: dict) -> GuardEvaluation | None:
     """Signature rules over the arguments. No model call."""
     start = time.perf_counter()
     text = _normalise("\n".join(_strings(args)))
     if text is None:
         return _regex_block(OwaspTag.NA, "The arguments are too long to screen.", start)
-    # Screen the text as written and with backslash continuations joined. Joining
-    # alone would hide a line that follows a comment ending in a backslash.
-    joined = text.replace("\\\r\n", " ").replace("\\\n", " ")
-    versions = [(v, v.casefold()) for v in ([text] if joined == text else [text, joined])]
+    # Python also ends a line at a carriage return.
+    versions = _versions(text.replace("\r\n", "\n").replace("\r", "\n"))
     for name, tag, signatures in _RULES:
         if any(
             any(trigger in folded for trigger in triggers) and pattern.search(version)
-            for version, folded in versions
+            for version, folded, anchored in versions
             for triggers, pattern in signatures
+            if not anchored or pattern.pattern.startswith(_STATEMENT_START)
         ):
             return _regex_block(tag, f"Matched a signature rule: {name}.", start)
     return None

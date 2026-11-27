@@ -257,6 +257,21 @@ BLOCKED = {
         "# x \\\nfrom subprocess import run\nrun(['id'])",
         "# \\\r\nimport requests as q",
         "(rm -rf /)",
+        # A comment's backslash above a continued import (review E1).
+        "# \\\nimport \\\nsocket",
+        "# \\\nimport \\\n subprocess as sp\nsp.run(['id'])",
+        "# \\\nfrom subprocess \\\nimport run\nrun(['id'])",
+        "# \\\nfrom socket \\\n import *",
+        "# \\\nimport os, \\\n socket",
+        "x=1 # \\\r\nimport \\\r\nrequests",
+        "# \\\\\nimport \\\nsocket",
+        "x = '#' + \\\n  y; import \\\n socket",
+        # A bare carriage return ends a line.
+        "#\rimport socket",
+        "x = 1\rimport subprocess",
+        "# \\\rimport \\\rsocket",
+        "urllib.request.\\\n    urlretrieve(u)",
+        "urllib . request .urlretrieve(u)",
         "/bin/rm -rf /",
         "x.rm -rf /",
         "import urllib.parse\nurllib.request.urlretrieve(u)",
@@ -325,6 +340,8 @@ BENIGN = [
     "from urllib.parse import urlencode",
     "from urllib import parse",
     "Explain urllib.request.",
+    "Explain urllib.request. Then give an example.",
+    "I studied urllib.request.\nNext topic",
     # Listed in review D1, but a method definition is exempt (A5) however it is read.
     "# \\\ndef eval(x)",
     "import urllib.parse",
@@ -376,6 +393,7 @@ def test_signatures_are_found_in_nested_arguments():
         "from os import a, ", "import a, ", ": ( {", "# retrieval and config.environment\n",
         "rm ", "rm a ", "rm -r a ", "\ufdfa", "\u2063", "\\\n",
         ".rm ", "(rm ", "df.rm ", "-rm ", "# \\\nx = 1\n", "total = a + \\\n    b\n",
+        "total = a + \\\n    b  # sum \\\n", "x = 1  # y\r\n",
     ],
 )
 def test_regex_gate_is_fast_on_the_largest_code(chunk):
