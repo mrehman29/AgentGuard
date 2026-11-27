@@ -1021,3 +1021,7 @@ async def test_mcp_tracker_failure_returns_sanitized_block(monkeypatch):
                         {"session_id": "bad\n"},
                     )
                     assert "error" in res_budget_inv.structuredContent
+
+
+def test_preset3_default_cap():
+    assert get_settings().preset3_session_cap_gbp == 0.0017

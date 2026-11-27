@@ -288,6 +288,7 @@ def env(monkeypatch, tmp_path, model, worker_url):
                 ["docker", "rm", "-f", *leftover],
                 capture_output=True,
                 check=False,
+                timeout=30,
             )
         assert not leftover, "containers were left behind"
 
