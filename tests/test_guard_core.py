@@ -252,6 +252,14 @@ BLOCKED = {
         "rm build dist -fr",
         "subprocess_args = 'rm /tmp/x --recursive --force'",
         "rm \\\n  -rf /",
+        "# \\\nimport socket",
+        "# \\\nimport subprocess as sp\nsp.run(['id'])",
+        "# x \\\nfrom subprocess import run\nrun(['id'])",
+        "# \\\r\nimport requests as q",
+        "(rm -rf /)",
+        "/bin/rm -rf /",
+        "x.rm -rf /",
+        "import urllib.parse\nurllib.request.urlretrieve(u)",
         "rm\\\r\n-rf /",
         "from os \\\nimport \\\n environ",
         "from os import *\nprint(environ)",
@@ -316,6 +324,9 @@ BENIGN = [
     "executive(summary)",
     "from urllib.parse import urlencode",
     "from urllib import parse",
+    "Explain urllib.request.",
+    # Listed in review D1, but a method definition is exempt (A5) however it is read.
+    "# \\\ndef eval(x)",
     "import urllib.parse",
     "import urllib.parse as up",
     "def eval(self, x):\n    return x",
@@ -364,6 +375,7 @@ def test_signatures_are_found_in_nested_arguments():
         "print(sum(range(101)))\n", "a ", " ", "\n", "ignore all ", "rm -a ", "curl ",
         "from os import a, ", "import a, ", ": ( {", "# retrieval and config.environment\n",
         "rm ", "rm a ", "rm -r a ", "\ufdfa", "\u2063", "\\\n",
+        ".rm ", "(rm ", "df.rm ", "-rm ", "# \\\nx = 1\n", "total = a + \\\n    b\n",
     ],
 )
 def test_regex_gate_is_fast_on_the_largest_code(chunk):

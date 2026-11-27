@@ -71,9 +71,11 @@ short sentence.
 # Separator between a command and its arguments, in shell text or an argv list.
 _SEP = r"[\s\"',]+"
 # Anything before the rm flag being looked for: options, or operands on the same
-# line of the same command. Stopping at the next "rm" keeps the search linear.
-_OPERAND = r"[ \t\"',]+(?!rm\b)[^\s\"',;|&#-][^\s\"',;|&]*"
-_BEFORE_FLAG = rf"(?:{_SEP}-[a-z-]+|{_OPERAND}){{0,6}}?{_SEP}"
+# line of the same command. Neither may be or end in the word "rm" (".rm", "-rm"):
+# a search starts there anyway, and stopping keeps the whole search fast.
+_OPTION = rf"{_SEP}-[a-z-]++(?<!\brm)"
+_OPERAND = r"[ \t\"',]+(?![#-])[^\s\"',;|&]++(?<!\brm)"
+_BEFORE_FLAG = rf"(?:{_OPTION}|{_OPERAND}){{0,6}}?{_SEP}"
 _NETWORK_MODULES = (
     "socket", "requests", "urllib", "urllib3", "httpx", "aiohttp",
     "http.client", "ftplib", "smtplib", "telnetlib", "paramiko",
@@ -193,6 +195,7 @@ _RULES = (
             ),
             _sig(r"\brequests\s*\.\s*(?:get|post|put|patch|delete|head|request)\s*\(", "requests"),
             _sig(r"\burlopen\s*\(", "urlopen"),
+            _sig(r"\burllib\s*\.\s*request\s*\.\s*\w", "urllib"),
             _sig(r"\bsocket\s*\.\s*(?:socket|create_connection)\s*\(", "socket"),
             _sig(r"/dev/tcp/", "/dev/tcp/"),
             _sig(r"\bnc[ \t]+-[a-z]*e\b", "nc"),
@@ -259,12 +262,14 @@ def fast_rule_check(tool_name: str, args: dict) -> GuardEvaluation | None:
     text = _normalise("\n".join(_strings(args)))
     if text is None:
         return _regex_block(OwaspTag.NA, "The arguments are too long to screen.", start)
-    # Backslash continuations: one logical line.
-    text = text.replace("\\\r\n", " ").replace("\\\n", " ")
-    folded = text.casefold()
+    # Screen the text as written and with backslash continuations joined. Joining
+    # alone would hide a line that follows a comment ending in a backslash.
+    joined = text.replace("\\\r\n", " ").replace("\\\n", " ")
+    versions = [(v, v.casefold()) for v in ([text] if joined == text else [text, joined])]
     for name, tag, signatures in _RULES:
         if any(
-            any(trigger in folded for trigger in triggers) and pattern.search(text)
+            any(trigger in folded for trigger in triggers) and pattern.search(version)
+            for version, folded in versions
             for triggers, pattern in signatures
         ):
             return _regex_block(tag, f"Matched a signature rule: {name}.", start)
