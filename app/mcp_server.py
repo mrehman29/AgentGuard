@@ -61,6 +61,12 @@ def _validate_session_id(val: Any) -> str:
     return val
 
 
+def _safe_session_id(val: Any) -> str:
+    if isinstance(val, str) and SESSION_ID_PATTERN.fullmatch(val):
+        return val
+    return "invalid"
+
+
 def _validate_arg_str(val: str, name: str, max_len: int = 20_000) -> str:
     if not isinstance(val, str):
         raise TypeError(f"{name} must be text")
@@ -92,7 +98,7 @@ async def guard_check_action(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
-                    session_id="invalid",
+                    session_id=_safe_session_id(session_id),
                     label="check",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
@@ -147,7 +153,7 @@ async def guard_execute_sandbox(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
-                    session_id="invalid",
+                    session_id=_safe_session_id(session_id),
                     label="execute",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
