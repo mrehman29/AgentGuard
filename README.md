@@ -160,11 +160,11 @@ Build the image, set a working API key, start the console and wait for the provi
 |---|---|---|---|
 | 1 Safe data query | Prompt is screened, the agent proposes Python, the code is screened and run | `ALLOW`, sandbox output, spend recorded | Yes |
 | 2 Prompt injection | The prompt hits a signature rule | `BLOCK` at the regex gate, `LLM01`; no model or sandbox call | No |
-| 3 Runaway cost loop | Fixed benign steps in a new `loop-…` session with a low cap; each step is classified | At the default cap, 3 steps run and step 4 is a budget `BLOCK` (expected, see below) | Yes |
+| 3 Runaway cost loop | Fixed benign steps in a new `loop-…` session with a low cap; each step is classified | At the default cap, 3 steps run and step 4 is a budget `BLOCK` | Yes |
 
 **Reset session** clears the spend of the session on screen and restores its default cap. After preset 3 it clears the `loop-…` session and returns to `demo`, whose spend is kept. Global spend and ledger entries are never cleared by reset; to start from nothing, stop all AgentGuard processes and delete `data/guard_state.db*`.
 
-Presets 1 and 2 have run end to end against the live API with the Docker sandbox. The preset 3 default cap was lowered from £0.002, which tripped at step 6, to £0.0017. The step 4 block at this cap has **not yet been confirmed live**. The step count depends on real token usage, so rehearse it and adjust `PRESET3_SESSION_CAP_GBP` if the breaker does not trip where you want it.
+On 2026-11-27, all three presets ran as expected in one live session with the real model and the Docker sandbox; preset 3, at the default £0.0017 cap, ran 3 steps and refused step 4 on budget. The step count depends on real token usage, so rehearse it and adjust `PRESET3_SESSION_CAP_GBP` if the breaker does not trip where you want it.
 
 Without a key, presets 1 and 3 show a classifier error `BLOCK` and nothing runs.
 

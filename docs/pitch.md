@@ -13,7 +13,7 @@ Reset the session between rehearsal and pitch.
 
 ## Before presenting
 
-- Presets 1 and 2 have run end to end with the Docker sandbox. **Preset 3 at its £0.0017 cap is not yet confirmed live:** it is expected to run 3 steps and block step 4. Rehearse it, check that `.env` does not still set `0.002`, and describe only what you see.
+- All three presets ran as expected in one live session with the real model and the Docker sandbox on 2026-11-27; preset 3, at its £0.0017 cap, ran 3 steps and refused step 4 on budget. Its step count depends on token usage, so still rehearse, check that `.env` does not still set `0.002`, and describe only what you see.
 - **Rate limits:** after about a dozen calls within seconds the API returned `429 RESOURCE_EXHAUSTED` and the guard blocked. Use a billing-enabled key, or pause between demo runs, including between rehearsal and pitch.
 - Presets 1 and 3 need a working Gemini key. If one does not behave as expected, say so: show preset 2, which needs no model, or a clearly labelled recording of a successful run if one exists.
 - Quote only measured cost and latency: 0.6-1.1 s per call and about £0.0002 per call at the configured rates (about 400 input and 50 output tokens), measured on 2026-11-27 with `gemini-3.5-flash-lite`. The spoken line rounds these. A run of preset 1 makes more than one call.
