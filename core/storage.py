@@ -348,11 +348,13 @@ def apply_retention(
             "DELETE FROM entries WHERE created_at > 0 AND created_at < ?", (cutoff,)
         ).rowcount
 
+        # The one full pass reads the table in order. The planner would walk
+        # usage_session and fetch each row from its own place on disk.
         groups = conn.execute(
             "SELECT session_id, client_id, cleared, SUM(prompt_tokens), SUM(candidates_tokens),"
             " SUM(thoughts_tokens), TOTAL(cost_gbp), SUM(summary = 0),"
             " TOTAL(CASE WHEN summary = 0 THEN cost_gbp END)"
-            f" FROM usage WHERE summary = 1 OR {old}"
+            f" FROM usage NOT INDEXED WHERE summary = 1 OR {old}"
             " GROUP BY session_id, client_id, cleared"
             " HAVING SUM(summary = 0) > 0 OR COUNT(*) > 1",
             (cutoff,),
@@ -361,8 +363,12 @@ def apply_retention(
         usage_pruned = 0
         cost_archived_gbp = 0.0
         for session_id, client_id, cleared, p, c, t, total, count, archived in groups:
+            # One of these runs per group, so it must find the group by session.
+            # The planner picks usage_client, which makes every local row
+            # (client_id NULL) a candidate each time: quadratic, under the write lock.
             conn.execute(
-                "DELETE FROM usage WHERE session_id = ? AND client_id IS ? AND cleared = ?"
+                "DELETE FROM usage INDEXED BY usage_session"
+                " WHERE session_id = ? AND client_id IS ? AND cleared = ?"
                 f" AND (summary = 1 OR {old})",
                 (session_id, client_id, cleared, cutoff),
             )

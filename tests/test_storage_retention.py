@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from core import budget_store
+from core import budget_store, storage
 from core.config import PROJECT_ROOT
 from core.schemas import LedgerEntry
 from storage_helpers import RATES, USAGE, query, reserve, use_database
@@ -126,6 +126,79 @@ def test_repeated_pruning_keeps_one_summary_per_group_and_legacy_rows(tracker, d
     before = tracker.check_budget("s")
     tracker.apply_retention(5)
     assert tracker.check_budget("s") == before
+
+
+class StatementLog(sqlite3.Connection):
+    """Keeps each statement with its parameters: the plan can depend on them."""
+
+    def execute(self, sql, parameters=()):
+        self.statements = [*getattr(self, "statements", []), (sql, parameters)]
+        return super().execute(sql, parameters)
+
+
+def many_sessions(path, client, sessions=4000, rows_each=5):
+    old = time.time() - OLD
+    prefix = f"{client}:" if client else ""
+    add_usage(path, [(f"{prefix}s{n}", client, 0.000001, old)
+                     for n in range(sessions) for _ in range(rows_each)])
+    return sessions * rows_each
+
+
+@pytest.mark.parametrize("client", [None, "big"], ids=["local rows", "one large client"])
+def test_retention_finds_each_group_by_its_session(tracker, database, client):
+    many_sessions(database, client, sessions=20)
+    conn = sqlite3.connect(database, isolation_level=None, factory=StatementLog)
+    try:
+        assert storage.apply_retention(conn, 5).usage_pruned == 100
+        plans = {}
+        for sql, parameters in list(conn.statements):
+            if sql.startswith(("BEGIN", "COMMIT")):
+                continue
+            rows = sqlite3.Connection.execute(conn, f"EXPLAIN QUERY PLAN {sql}", parameters)
+            plans.setdefault(" ".join(sql.split()[:3]), set()).update(row[3] for row in rows)
+    finally:
+        conn.close()
+    # Every statement in the write lock. Only the grouping may read all of usage,
+    # and it runs once; a new statement must be added here with its plan.
+    assert plans == {
+        "DELETE FROM entries": {
+            "SEARCH entries USING INDEX entries_created_at (created_at>? AND created_at<?)"
+        },
+        "SELECT session_id, client_id,": {
+            "SCAN usage", "USE TEMP B-TREE FOR GROUP BY",
+        },
+        "DELETE FROM usage": {
+            "SEARCH usage USING INDEX usage_session (session_id=? AND cleared=?)"
+        },
+        "INSERT INTO usage": set(),
+    }
+
+
+@pytest.mark.parametrize("client", [None, "big"], ids=["local rows", "one large client"])
+def test_retention_work_grows_with_the_rows_not_their_square(tracker, database, client):
+    """Counts SQLite's own instructions, so the speed of the disk does not matter."""
+    rows = many_sessions(database, client)
+    budget = 400 * rows  # a pass per session would need thousands per row
+    conn = sqlite3.connect(database, isolation_level=None)
+
+    def prune():
+        done = [0]
+
+        def count():
+            done[0] += 1000
+            return done[0] > budget  # non-zero stops the statement
+
+        conn.set_progress_handler(count, 1000)
+        return storage.apply_retention(conn, 5)
+
+    try:
+        assert prune().usage_pruned == rows
+        # The next run merges new old rows into the 4,000 summaries now there.
+        more = many_sessions(database, client, rows_each=1)
+        assert prune().usage_pruned == more
+        assert conn.execute("SELECT COUNT(*), SUM(summary) FROM usage").fetchone() == (4000, 4000)
+    finally:
+        conn.close()
 
 
 def test_old_entries_are_pruned_and_recent_ones_kept(tracker):
