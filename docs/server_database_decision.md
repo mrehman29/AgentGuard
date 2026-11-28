@@ -65,7 +65,8 @@ SQLite 3.53.1. One run of each row; expect variation between runs.
 - Single runs vary: on disk, 4 processes at 10,000 rows measured faster than at 0.
 - Retention is **off by default**. Pruning (`LEDGER_RETENTION_DAYS`, see the
   backup guide) replaces old rows with one summary row per session and so bounds
-  the table.
+  the table. It runs as many short transactions with a pause after each, so calls
+  continue while it does.
 
 Not measured: network or cloud disks, other machines, more than 4 processes, and
 a full request through the web server at saturation.

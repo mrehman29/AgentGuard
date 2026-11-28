@@ -4,10 +4,12 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +20,18 @@ from typing import Iterator
 logger = logging.getLogger(__name__)
 
 CURRENT_SCHEMA_VERSION = 2
+
+# One retention transaction removes at most this many entries and this many usage
+# rows, so how long it holds the write lock does not grow with the ledger.
+RETENTION_BATCH_ROWS = 500
+# Between two of them. A writer that is waiting sleeps up to 100 ms between tries
+# (SQLite's busy handler), so a longer gap lets every waiter try while the lock is free.
+RETENTION_PAUSE_SEC = 0.125
+# Writers that keep a ledger busy leave only brief gaps, which a prune using
+# SQLite's own back-off can miss for good. It asks this often instead, and gives
+# up only after this long without once getting the lock.
+RETENTION_POLL_SEC = 0.001
+RETENTION_LOCK_WAIT_SEC = 60.0
 
 _V1_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS usage (
@@ -70,6 +84,9 @@ _V2_INDEXES = (
     "CREATE INDEX IF NOT EXISTS entries_created_at ON entries (created_at)",
     "CREATE INDEX IF NOT EXISTS reservations_client_id ON reservations (client_id)",
     "CREATE INDEX IF NOT EXISTS reservations_expires_at ON reservations (expires_at)",
+    # Finds a group's summary row without reading the group's other rows.
+    "CREATE INDEX IF NOT EXISTS usage_summary ON usage (session_id, cleared, client_id)"
+    " WHERE summary = 1",
 )
 
 # What a restorable backup must hold. Version 0 and 1 are the v1.0 layout.
@@ -136,6 +153,35 @@ def ledger_lock(db_path: Path | str, *, exclusive: bool = False, timeout: float 
         yield
     finally:
         os.close(fd)
+
+
+@contextmanager
+def _write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    """BEGIN IMMEDIATE, then COMMIT, or roll back and raise the first error."""
+    conn.execute("BEGIN IMMEDIATE")
+    with _commit_or_roll_back(conn):
+        yield
+
+
+@contextmanager
+def _commit_or_roll_back(conn: sqlite3.Connection) -> Iterator[None]:
+    """End the transaction already begun on conn."""
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        _roll_back(conn)
+        raise
+
+
+def _roll_back(conn: sqlite3.Connection) -> None:
+    """Roll back while another error is being raised, without hiding it."""
+    # SQLite has already rolled back after some errors (full disk, I/O, interrupt).
+    if conn.in_transaction:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            logger.exception("rollback failed")
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -273,8 +319,7 @@ def migrate_database(conn: sqlite3.Connection) -> int:
     """
     if _is_current(conn):
         return CURRENT_SCHEMA_VERSION
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with _write_transaction(conn):
         version = get_schema_version(conn)
         if version > CURRENT_SCHEMA_VERSION:
             raise ValueError(
@@ -283,7 +328,6 @@ def migrate_database(conn: sqlite3.Connection) -> int:
 
         if version == CURRENT_SCHEMA_VERSION:
             _add_v2_schema(conn)  # no change unless something is missing
-            conn.execute("COMMIT")
             return version
 
         db_file = _get_db_file_path(conn)
@@ -319,72 +363,167 @@ def migrate_database(conn: sqlite3.Connection) -> int:
             (now,),
         )
         conn.execute("PRAGMA user_version = 2")
-        conn.execute("COMMIT")
-        return 2
+    return CURRENT_SCHEMA_VERSION
+
+
+# A summary group is (session_id, client_id, cleared). Rows below are
+# (id, prompt_tokens, candidates_tokens, thoughts_tokens, cost_gbp).
+
+
+def _summary_rows(conn: sqlite3.Connection, group: tuple, limit: int) -> list[tuple]:
+    session_id, client_id, cleared = group
+    return conn.execute(
+        "SELECT id, prompt_tokens, candidates_tokens, thoughts_tokens, cost_gbp"
+        " FROM usage INDEXED BY usage_summary"
+        " WHERE summary = 1 AND session_id = ? AND client_id IS ? AND cleared = ? LIMIT ?",
+        (session_id, client_id, cleared, limit),
+    ).fetchall()
+
+
+def _delete_usage(conn: sqlite3.Connection, ids: list[int]) -> None:
+    if ids:
+        marks = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM usage WHERE id IN ({marks})", ids)
+
+
+def _fold(
+    conn: sqlite3.Connection, group: tuple, summaries: list[tuple], rows: list[tuple]
+) -> list[int]:
+    """Add rows, and any further summaries, into the group's first summary row.
+
+    Returns the ids now counted there, which the caller must delete in the same
+    transaction.
+    """
+    parts = summaries + rows
+    _, prompt, candidates, thoughts, cost = zip(*parts)
+    totals = (sum(prompt), sum(candidates), sum(thoughts), math.fsum(cost))
+    if summaries:
+        conn.execute(
+            "UPDATE usage SET prompt_tokens = ?, candidates_tokens = ?, thoughts_tokens = ?,"
+            " cost_gbp = ? WHERE id = ?",
+            (*totals, summaries[0][0]),
+        )
+        return [part[0] for part in parts[1:]]
+    session_id, client_id, cleared = group
+    conn.execute(
+        "INSERT INTO usage (session_id, client_id, cleared, prompt_tokens, candidates_tokens,"
+        " thoughts_tokens, cost_gbp, created_at, summary) VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 1)",
+        (session_id, client_id, cleared, *totals),
+    )
+    return [part[0] for part in parts]
+
+
+def _prune_usage_batch(conn: sqlite3.Connection, cutoff: float, limit: int) -> list[float]:
+    """Move up to limit old usage rows into their summaries. Returns their costs."""
+    found = conn.execute(
+        "SELECT session_id, client_id, cleared, id, prompt_tokens, candidates_tokens,"
+        " thoughts_tokens, cost_gbp FROM usage INDEXED BY usage_created_at"
+        " WHERE created_at > 0 AND created_at < ? AND summary = 0"
+        " ORDER BY created_at LIMIT ?",
+        (cutoff, limit),
+    ).fetchall()
+    groups: dict[tuple, list[tuple]] = {}
+    for row in found:
+        groups.setdefault(row[:3], []).append(row[3:])
+    counted: list[int] = []
+    for group, rows in groups.items():
+        counted += _fold(conn, group, _summary_rows(conn, group, 1), rows)
+    _delete_usage(conn, counted)
+    return [row[-1] for row in found]
+
+
+def _merge_duplicate_summaries(conn: sqlite3.Connection, stop: threading.Event) -> None:
+    """Leave one summary per group. A reset can bring two summaries into one group."""
+    # Read without the write lock: this looks at every summary.
+    groups = conn.execute(
+        "SELECT session_id, client_id, cleared FROM usage INDEXED BY usage_summary"
+        " WHERE summary = 1 GROUP BY session_id, cleared, client_id HAVING COUNT(*) > 1"
+    ).fetchall()
+    while groups:
+        _let_writers_in(stop)
+        if not _begin_retention(conn, stop):
+            return
+        with _commit_or_roll_back(conn):
+            room = RETENTION_BATCH_ROWS
+            while groups and room >= 2:
+                # Read again under the lock: another prune may have merged them.
+                summaries = _summary_rows(conn, groups[-1], room)
+                if len(summaries) >= 2:
+                    _delete_usage(conn, _fold(conn, groups[-1], summaries, []))
+                if len(summaries) < room:
+                    groups.pop()  # all of this group's summaries were read
+                room -= max(len(summaries), 1)
+
+
+def _begin_retention(conn: sqlite3.Connection, stop: threading.Event) -> bool:
+    """Take the write lock, polling for it. False if stop was set first."""
+    (busy_timeout,) = conn.execute("PRAGMA busy_timeout").fetchone()
+    deadline = time.monotonic() + RETENTION_LOCK_WAIT_SEC
+    try:
+        conn.execute("PRAGMA busy_timeout = 0")  # no back-off: a miss returns at once
+        try:
+            while not stop.is_set():
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    return True
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) or time.monotonic() >= deadline:
+                        raise
+                stop.wait(RETENTION_POLL_SEC)
+            return False
+        finally:
+            conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout)}")
     except BaseException:
-        conn.execute("ROLLBACK")
+        _roll_back(conn)  # the lock may have been taken before the error
         raise
 
 
+def _let_writers_in(stop: threading.Event) -> None:
+    """Called between retention transactions, with no lock held."""
+    stop.wait(RETENTION_PAUSE_SEC)
+
+
 def apply_retention(
-    conn: sqlite3.Connection, retention_days: int
+    conn: sqlite3.Connection, retention_days: int, *, stop: threading.Event | None = None
 ) -> RetentionStats:
     """Prune entries and usage older than retention_days.
 
-    Pruned usage is added to one summary row per (session_id, client_id, cleared)
-    holding the exact sum, with created_at = 0; older summaries are merged into it.
-    Other rows with created_at = 0 (legacy v1) are never deleted, and neither is
-    any reservation: an expired one can still be committed by a late call.
+    Pruned usage is added to one summary row per (session_id, client_id, cleared),
+    with created_at = 0. Other rows with created_at = 0 (legacy v1) are never
+    deleted, and neither is any reservation: an expired one can still be committed
+    by a late call.
+
+    The work is a series of short transactions, each of which leaves every total as
+    it was. After an error or a kill, what was committed stays and the next run does
+    the rest. Setting stop ends the run before its next transaction.
     """
     if retention_days <= 0:
         return RetentionStats(0, 0, 0.0)
 
     cutoff = time.time() - (retention_days * 86400)
-    old = "(summary = 0 AND created_at > 0 AND created_at < ?)"
+    stop = stop or threading.Event()
+    entries_pruned = usage_pruned = 0
+    cost_archived_gbp = 0.0
 
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        entries_pruned = conn.execute(
-            "DELETE FROM entries WHERE created_at > 0 AND created_at < ?", (cutoff,)
-        ).rowcount
+    while _begin_retention(conn, stop):
+        limit = RETENTION_BATCH_ROWS
+        with _commit_or_roll_back(conn):
+            entries = conn.execute(
+                "DELETE FROM entries WHERE id IN (SELECT id FROM entries"
+                " WHERE created_at > 0 AND created_at < ? ORDER BY created_at LIMIT ?)",
+                (cutoff, limit),
+            ).rowcount
+            costs = _prune_usage_batch(conn, cutoff, limit)
+        # Counted only once committed.
+        entries_pruned += entries
+        usage_pruned += len(costs)
+        cost_archived_gbp += math.fsum(costs)
+        if entries < limit and len(costs) < limit:
+            break
+        _let_writers_in(stop)
 
-        # The one full pass reads the table in order. The planner would walk
-        # usage_session and fetch each row from its own place on disk.
-        groups = conn.execute(
-            "SELECT session_id, client_id, cleared, SUM(prompt_tokens), SUM(candidates_tokens),"
-            " SUM(thoughts_tokens), TOTAL(cost_gbp), SUM(summary = 0),"
-            " TOTAL(CASE WHEN summary = 0 THEN cost_gbp END)"
-            f" FROM usage NOT INDEXED WHERE summary = 1 OR {old}"
-            " GROUP BY session_id, client_id, cleared"
-            " HAVING SUM(summary = 0) > 0 OR COUNT(*) > 1",
-            (cutoff,),
-        ).fetchall()
-
-        usage_pruned = 0
-        cost_archived_gbp = 0.0
-        for session_id, client_id, cleared, p, c, t, total, count, archived in groups:
-            # One of these runs per group, so it must find the group by session.
-            # The planner picks usage_client, which makes every local row
-            # (client_id NULL) a candidate each time: quadratic, under the write lock.
-            conn.execute(
-                "DELETE FROM usage INDEXED BY usage_session"
-                " WHERE session_id = ? AND client_id IS ? AND cleared = ?"
-                f" AND (summary = 1 OR {old})",
-                (session_id, client_id, cleared, cutoff),
-            )
-            conn.execute(
-                "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens, "
-                "thoughts_tokens, cost_gbp, cleared, created_at, summary) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 1)",
-                (session_id, client_id, p, c, t, total, cleared),
-            )
-            usage_pruned += count
-            cost_archived_gbp += archived
-
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
+    if not stop.is_set():
+        _merge_duplicate_summaries(conn, stop)
 
     return RetentionStats(
         entries_pruned=entries_pruned,

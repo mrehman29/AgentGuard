@@ -73,7 +73,9 @@ def _check_amount(value: float) -> None:
         raise ValueError("amount must be a finite number, zero or more")
 
 
-async def _wait_out(future: asyncio.Future) -> asyncio.CancelledError | None:
+async def _wait_out(
+    future: asyncio.Future, on_cancel: Callable[[], None] | None = None
+) -> asyncio.CancelledError | None:
     """Wait until future is done, however often the caller is cancelled meanwhile.
 
     Returns the first cancellation, which the caller must raise. The shield stops
@@ -83,6 +85,8 @@ async def _wait_out(future: asyncio.Future) -> asyncio.CancelledError | None:
     try:
         await asyncio.wait([future])  # never cancels the future
     except asyncio.CancelledError as cancelled:
+        if on_cancel is not None:
+            on_cancel()
         with anyio.CancelScope(shield=True):
             while not future.done():
                 try:
@@ -417,10 +421,13 @@ class SessionBudgetTracker:
                 ).fetchall()
         return [LedgerEntry.model_validate_json(row[0]) for row in reversed(rows)]
 
-    def apply_retention(self, retention_days: int) -> RetentionStats:
+    def apply_retention(
+        self, retention_days: int, *, stop: threading.Event | None = None
+    ) -> RetentionStats:
+        """Prune in short transactions. Setting stop ends it before the next one."""
         connection = self._connect()
         try:
-            return apply_retention(connection, retention_days)
+            return apply_retention(connection, retention_days, stop=stop)
         finally:
             connection.close()
 
@@ -431,7 +438,11 @@ class SessionBudgetTracker:
     # is always waited for, and a cancellation is raised only after it ends.
 
     async def _write_out(
-        self, func: Callable[..., T], *args: Any, **kwargs: Any
+        self,
+        func: Callable[..., T],
+        *args: Any,
+        on_cancel: Callable[[], None] | None = None,
+        **kwargs: Any,
     ) -> tuple[T, asyncio.CancelledError | None]:
         """Run a write to its end. Returns its result and any cancellation received.
 
@@ -439,7 +450,7 @@ class SessionBudgetTracker:
         """
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(self._executor, partial(func, *args, **kwargs))
-        cancelled = await _wait_out(future)
+        cancelled = await _wait_out(future, on_cancel)
         if cancelled is not None and (error := future.exception()) is not None:
             logger.error("ledger write failed in a cancelled call: %s", type(error).__name__)
             raise cancelled from error
@@ -510,7 +521,14 @@ class SessionBudgetTracker:
         return await self._read(self.recent_entries, limit, client_id)
 
     async def aapply_retention(self, retention_days: int) -> RetentionStats:
-        return await self._write(self.apply_retention, retention_days)
+        """Prune. A cancelled call stops it after the transaction in progress."""
+        stop = threading.Event()
+        result, cancelled = await self._write_out(
+            self.apply_retention, retention_days, on_cancel=stop.set, stop=stop
+        )
+        if cancelled is not None:
+            raise cancelled
+        return result
 
     async def abackup(self, dest_backup_path: Path | str) -> Path:
         return await self._write(self.backup, dest_backup_path)

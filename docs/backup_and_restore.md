@@ -15,7 +15,7 @@ AgentGuard stores token usage metrics and audit log entries in its SQLite databa
 
 > [!IMPORTANT]
 > **Retention never alters what counts against a session, client, or global budget cap.**
-> `usage` rows older than the window (`created_at > 0 AND created_at < cutoff`) are added to one summary row per `(session_id, client_id, cleared)`, holding the exact sum with `created_at = 0.0`. Later prunes merge into that summary.
+> `usage` rows older than the window (`created_at > 0 AND created_at < cutoff`) are added to one summary row per `(session_id, client_id, cleared)`, holding their sum with `created_at = 0.0` (a floating-point sum, rounded once each time rows are added to it). Later prunes merge into that summary, and merge any second summary a reset has brought into the same group.
 > Legacy rows (made before schema v2, `created_at = 0.0`) are **never deleted**.
 > **No reservation is ever deleted by retention.** An expired reservation stops counting against the caps but can still be committed if its call finishes late. Reservations left by processes that died therefore stay in the table.
 >
@@ -26,6 +26,23 @@ Old audit `entries` are deleted; entries with no readable time are kept.
 ### Who may reset
 
 Resetting a session also lowers its client's spend, so it reopens the client cap. Only an administrator may reset a session or a client; Story #33's routes enforce this. Global spend is never lowered by a reset.
+
+### How a prune runs
+
+A prune is **not one transaction**. It is a series of short ones, so that calls can keep using the ledger:
+
+- Each transaction removes at most 500 entries and 500 usage rows and adds those rows to their summaries. How long it holds the write lock does not grow with the ledger, with the amount to prune, or with the size of one session or client.
+- After each one the prune waits 0.125 s. That is longer than the longest sleep of a waiting SQLite writer (0.1 s), so waiting calls get the lock in the gap.
+- **Every committed transaction leaves session, client and global totals as they were.** While a prune runs, and after one that stopped early, some old rows are summarised and others not yet.
+- **Stopping is safe.** After an error, a cancelled `aapply_retention` (it stops after the transaction in progress) or a killed process, committed work stays. Run the prune again to finish it. The command prints counts only when it completes.
+- Two prunes at once are safe: each row is summarised once. So is a backup during a prune: it copies the ledger as of one committed transaction. Restore refuses while a prune runs.
+- While calls keep the ledger busy, the prune asks for the write lock every millisecond. It stops with `database is locked` only after 60 s without getting it once. Run it again.
+
+It takes time: the pauses alone are 0.125 s for every 500 rows (about 2 minutes for 500,000). Measured on a local ext4 disk with one audit entry per usage row: 100,000 usage rows in 20,000 sessions took 32 s, with no single lock over 0.08 s; 500,000 rows took 2 to 5 minutes depending on the number of sessions and the load, with no single lock over 0.41 s. Another disk will differ.
+
+On a large ledger, calls can fail with `database is locked` when several processes write without pause, **with or without a prune**: every reservation adds up the whole `usage` table under the write lock (see the [server database decision](server_database_decision.md)). A completed prune shrinks that table.
+
+The first start of this version on an existing ledger builds the index that finds summaries, in one transaction that grows with the ledger (0.25 s with 500,000 usage rows).
 
 ### Running Retention Pruning
 
