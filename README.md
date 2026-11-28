@@ -210,9 +210,11 @@ The storage management CLI (`python -m core.storage`) handles migrations, backup
 # Hot online backup to a destination file (mode 0600)
 .venv/bin/python -m core.storage backup data/guard_state.db data/backups/guard_state.bak
 
-# Restore database from backup (requires stopped server; creates .pre-restore.bak)
+# Restore database from backup (stop every process using it; creates .pre-restore.bak)
 .venv/bin/python -m core.storage restore data/backups/guard_state.bak data/guard_state.db --force
 ```
+
+Stop old server processes before the first start of a new version. `migrate` and `prune` refuse a path that is not an existing ledger. Only an administrator should reset budgets: a session reset also lowers its client's spend.
 
 For retention policy and server database scale analysis, see:
 - [Backup and Restore Guide](docs/backup_and_restore.md)
