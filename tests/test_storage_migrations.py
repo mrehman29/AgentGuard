@@ -1,195 +1,185 @@
-"""Tests for storage schema versioning and database upgrades."""
+"""Schema upgrade from a v1.0 ledger (#41 AC2)."""
 
-import json
+import os
 import sqlite3
-import threading
-import time
-from datetime import UTC, datetime
+import subprocess
+import sys
 
 import pytest
+from pydantic import ValidationError
 
 from core import budget_store, storage
-from core.schemas import LedgerEntry, ModelRates, TokenUsage
-
-RATES = ModelRates(
-    provider="gemini",
-    model="gemini-3.5-flash-lite",
-    input_cost_per_1m_usd=0.30,
-    output_cost_per_1m_usd=2.50,
-    usd_to_gbp=0.80,
+from core.config import PROJECT_ROOT
+from storage_helpers import (
+    USAGE, create_ledger, create_v1_database, dump, query, reserve, use_database, write_lock,
 )
 
-V1_SCHEMA_STATEMENTS = (
-    """CREATE TABLE usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        prompt_tokens INTEGER NOT NULL,
-        candidates_tokens INTEGER NOT NULL,
-        thoughts_tokens INTEGER NOT NULL,
-        cost_gbp REAL NOT NULL,
-        cleared INTEGER NOT NULL DEFAULT 0
-    )""",
-    "CREATE INDEX usage_session ON usage (session_id, cleared)",
-    """CREATE TABLE reservations (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        amount_gbp REAL NOT NULL,
-        expires_at REAL NOT NULL
-    )""",
-    """CREATE TABLE session_caps (
-        session_id TEXT PRIMARY KEY,
-        cap_gbp REAL NOT NULL
-    )""",
-    """CREATE TABLE entries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entry TEXT NOT NULL
-    )""",
-)
+RATE_COLUMNS = ("input_cost_per_1m_usd", "output_cost_per_1m_usd", "usd_to_gbp")
 
 
-def create_v1_database(db_path):
-    """Build an exact v1.0 database matching pre-#41 code (user_version = 0)."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    for stmt in V1_SCHEMA_STATEMENTS:
-        conn.execute(stmt)
+@pytest.fixture
+def v1(tmp_path, monkeypatch):
+    path = create_v1_database(tmp_path / "ledger.db")
+    use_database(monkeypatch, path)
+    return path
 
-    now_iso = datetime.now(UTC).isoformat()
-    # Insert legacy sample records
-    conn.execute(
-        "INSERT INTO usage (session_id, prompt_tokens, candidates_tokens, thoughts_tokens, cost_gbp, cleared)"
-        " VALUES ('legacy-sess', 100, 50, 10, 0.005, 0)"
-    )
-    conn.execute(
-        "INSERT INTO usage (session_id, prompt_tokens, candidates_tokens, thoughts_tokens, cost_gbp, cleared)"
-        " VALUES ('legacy-sess', 80, 20, 5, 0.002, 1)"
-    )
+
+def migrate(path):
+    conn = sqlite3.connect(path)
+    try:
+        return storage.migrate_database(conn)
+    finally:
+        conn.close()
+
+
+def backups(path):
+    return sorted(path.parent.glob(f"{path.name}.v1.bak*"))
+
+
+def test_upgrade_from_the_committed_v1_dump(v1):
+    before = dump(v1)
+    tracker = budget_store.get_tracker()
+    assert query(v1, "PRAGMA user_version") == [(2,)]
+    [backup] = backups(v1)
+    assert backup.name == "ledger.db.v1.bak" and backup.stat().st_mode & 0o777 == 0o600
+    assert query(backup, "PRAGMA user_version") == [(0,)] and dump(backup) == before
+
+    status = tracker.check_budget("legacy-sess")
+    assert (status.spent_gbp, status.reserved_gbp, status.cap_gbp) == (0.005, 0.0015, 0.03)
+    assert status.global_spent_gbp == pytest.approx(0.008)
+    assert query(v1, "SELECT COUNT(*) FROM entries WHERE created_at > 1767000000") == [(2,)]
+
+
+def test_legacy_rows_get_no_client_even_with_a_colon_in_the_key(v1):
+    tracker = budget_store.get_tracker()
+    for table in ("usage", "reservations", "entries"):
+        assert query(v1, f"SELECT COUNT(*) FROM {table} WHERE client_id IS NOT NULL") == [(0,)]
+    assert tracker.recent_entries(client_id="demo") == []
+    assert len(tracker.recent_entries()) == 2
+
+
+def test_rate_columns_are_nullable_with_no_default(v1):
+    budget_store.get_tracker()
+    columns = {row[1]: row for row in query(v1, "PRAGMA table_info(reservations)")}
+    for name in RATE_COLUMNS:
+        _, _, _, not_null, default, _ = columns[name]
+        assert (not_null, default) == (0, None)
+
+
+def test_a_reservation_with_null_rates_is_charged_its_amount(v1):
+    tracker = budget_store.get_tracker()
+    assert tracker.commit("res-legacy", USAGE).cost_gbp == 0.0015
+    # A process still running the old code inserts no rates either.
+    conn = sqlite3.connect(v1)
     conn.execute(
         "INSERT INTO reservations (id, session_id, amount_gbp, expires_at)"
-        " VALUES ('res-legacy', 'legacy-sess', 0.0015, ?)",
-        (time.time() + 60,),
+        " VALUES ('old-code', 's', 0.002, 4102444800.0)"
     )
-    conn.execute(
-        "INSERT INTO session_caps (session_id, cap_gbp) VALUES ('legacy-sess', 0.03)"
-    )
-    legacy_entry = json.dumps(
-        {
-            "time": now_iso,
-            "source": "web",
-            "session_id": "legacy-sess",
-            "label": "screen",
-            "outcome": "ALLOW",
-            "cost_gbp": 0.005,
-        }
-    )
-    conn.execute("INSERT INTO entries (entry) VALUES (?)", (legacy_entry,))
     conn.commit()
     conn.close()
+    assert tracker.commit("old-code", USAGE).cost_gbp == 0.002
 
 
-def test_migration_from_v1_database(tmp_path, monkeypatch):
-    db_file = tmp_path / "legacy_v1.db"
-    create_v1_database(db_file)
-
-    # Verify initial v1 state
-    conn = sqlite3.connect(db_file)
-    assert storage.get_schema_version(conn) == 0
-    conn.close()
-
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
-    monkeypatch.setattr(budget_store, "_tracker", None)
-
-    # Initialize tracker, which runs migrate_database
+def test_a_zero_rate_is_not_taken_for_a_pre_v2_reservation(v1):
+    """Pricing free rates is #30's; here they must never be charged as the amount."""
     tracker = budget_store.get_tracker()
-
-    # Verify backup file <db>.v1.bak was created with mode 0600
-    bak_file = db_file.with_name(f"{db_file.name}.v1.bak")
-    assert bak_file.exists()
-    assert (bak_file.stat().st_mode & 0o777) == 0o600
-
-    conn = sqlite3.connect(db_file)
-    try:
-        assert storage.get_schema_version(conn) == storage.CURRENT_SCHEMA_VERSION
-        # Check migrations table
-        cursor = conn.execute("SELECT version, description FROM schema_migrations ORDER BY version")
-        migrations = cursor.fetchall()
-        assert len(migrations) == 2
-        assert migrations[0][0] == 1
-        assert migrations[1][0] == 2
-
-        # Check columns
-        cursor = conn.execute("PRAGMA table_info(usage)")
-        col_names = [r[1] for r in cursor.fetchall()]
-        assert "created_at" in col_names
-        assert "client_id" in col_names
-
-        cursor = conn.execute("PRAGMA table_info(entries)")
-        col_names = [r[1] for r in cursor.fetchall()]
-        assert "created_at" in col_names
-        assert "client_id" in col_names
-
-        # Check backfilled timestamp on legacy entry
-        cursor = conn.execute("SELECT created_at FROM entries LIMIT 1")
-        (ts,) = cursor.fetchone()
-        assert ts > 0
-    finally:
-        conn.close()
-
-    # Pre-v2 reservation commits at amount_gbp (0.0015)
-    commit_res = tracker.commit(
-        "res-legacy", TokenUsage(prompt_tokens=100, candidates_tokens=100, thoughts_tokens=0)
+    held = reserve(tracker, "free", 0.002)
+    conn = sqlite3.connect(v1)
+    conn.execute(
+        "UPDATE reservations SET input_cost_per_1m_usd = 0, output_cost_per_1m_usd = 0,"
+        " usd_to_gbp = 0 WHERE id = ?", (held,)
     )
-    assert commit_res.cost_gbp == 0.0015
-
-    # Verify budget status calculation on migrated database
-    status = tracker.check_budget("legacy-sess")
-    assert status.session_id == "legacy-sess"
-    assert status.prompt_tokens == 200
-    assert abs(status.spent_gbp - (0.005 + 0.0015)) < 1e-6
-    assert status.reserved_gbp == 0.0
-    assert status.cap_gbp == 0.03
+    conn.commit()
+    conn.close()
+    try:
+        charged = tracker.commit(held, USAGE).cost_gbp
+    except ValidationError:
+        charged = 0
+    assert charged == tracker.check_budget("free").spent_gbp == 0
 
 
-def test_reject_unsupported_future_version(tmp_path):
-    future_db = tmp_path / "future.db"
-    conn = sqlite3.connect(future_db)
+def test_a_failed_upgrade_changes_nothing_and_can_be_retried(v1, monkeypatch):
+    before = dump(v1)
+    with monkeypatch.context() as broken:
+        broken.setattr(storage, "_V2_INDEXES", (*storage._V2_INDEXES, "CREATE INDEX x ON no_table (y)"))
+        with pytest.raises(sqlite3.OperationalError):
+            migrate(v1)
+    assert dump(v1) == before and query(v1, "PRAGMA user_version") == [(0,)]
+    [first] = backups(v1)
+    stamp = first.stat().st_mtime_ns
+    assert migrate(v1) == 2
+    # The name was taken: the retry made a new backup and left the first alone.
+    assert len(backups(v1)) == 2 and first.stat().st_mtime_ns == stamp
+    assert all(dump(b) == before for b in backups(v1))
+
+
+def test_a_new_ledger_leaves_no_backup(tmp_path, monkeypatch):
+    path = tmp_path / "new.db"
+    use_database(monkeypatch, path)
+    budget_store.get_tracker()
+    assert backups(path) == []
+
+
+def test_an_existing_backup_is_never_overwritten_or_relied_on(v1):
+    old = v1.with_name("ledger.db.v1.bak")
+    old.write_text("an older backup")
+    before = dump(v1)
+    migrate(v1)
+    assert old.read_text() == "an older backup"
+    [new] = [b for b in backups(v1) if b != old]
+    assert dump(new) == before and new.stat().st_mode & 0o777 == 0o600
+
+
+def test_newer_schema_is_refused(tmp_path):
+    path = create_ledger(tmp_path / "future.db", "s")
+    conn = sqlite3.connect(path)
     conn.execute("PRAGMA user_version = 9")
+    with pytest.raises(ValueError, match="newer than supported"):
+        storage.migrate_database(conn)
     conn.close()
 
-    conn2 = sqlite3.connect(future_db)
-    try:
-        with pytest.raises(ValueError, match="is newer than supported version"):
-            storage.migrate_database(conn2)
-    finally:
-        conn2.close()
+
+def test_rate_columns_from_an_unreleased_build_are_refused(tmp_path):
+    path = create_ledger(tmp_path / "odd.db", "s")
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE reservations DROP COLUMN usd_to_gbp")
+    conn.execute("ALTER TABLE reservations ADD COLUMN usd_to_gbp REAL NOT NULL DEFAULT 0.0")
+    with pytest.raises(ValueError, match="nullable with no default"):
+        storage.migrate_database(conn)
+    conn.close()
 
 
-def test_concurrent_starters_migration(tmp_path, monkeypatch):
-    """AC2: Concurrent starters both migrate cleanly without corrupting schema or backup."""
-    db_file = tmp_path / "concurrent_mig.db"
-    create_v1_database(db_file)
+def test_concurrent_process_starts_upgrade_once(v1):
+    conn = sqlite3.connect(v1)
+    conn.executemany(
+        "INSERT INTO usage (session_id, prompt_tokens, candidates_tokens, thoughts_tokens,"
+        " cost_gbp) VALUES ('bulk', 1, 1, 0, 0.0000001)", [()] * 20_000
+    )
+    conn.commit()
+    conn.close()
+    code = (
+        "from core import budget_store\n"
+        "print(budget_store.SessionBudgetTracker().check_budget('bulk').prompt_tokens)\n"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", code], cwd=PROJECT_ROOT, env=os.environ,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(6)
+    ]
+    for process in processes:
+        out, err = process.communicate(timeout=60)
+        assert (process.returncode, out.strip()) == (0, "20000"), err
+    [backup] = backups(v1)
+    assert query(backup, "PRAGMA user_version") == [(0,)]
+    assert query(backup, "SELECT COUNT(*) FROM usage") == [(20_003,)]
+    assert query(v1, "PRAGMA user_version") == [(2,)]
 
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
 
-    errors = []
-
-    def starter():
-        try:
-            tracker = budget_store.SessionBudgetTracker()
-            st = tracker.check_budget("legacy-sess")
-            assert st.spent_gbp > 0
-        except Exception as e:
-            errors.append(e)
-
-    threads = [threading.Thread(target=starter) for _ in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert not errors, f"Concurrent starters failed with errors: {errors}"
-    conn = sqlite3.connect(db_file)
-    try:
-        assert storage.get_schema_version(conn) == storage.CURRENT_SCHEMA_VERSION
-    finally:
-        conn.close()
+def test_a_current_ledger_opens_while_another_process_is_writing(tmp_path, monkeypatch):
+    path = create_ledger(tmp_path / "busy.db", "s")
+    monkeypatch.setattr(budget_store, "BUSY_TIMEOUT_MS", 100)
+    use_database(monkeypatch, path)
+    with write_lock(path):
+        assert budget_store.get_tracker().check_budget("s").prompt_tokens == 1

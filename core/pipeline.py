@@ -82,19 +82,6 @@ def _safe_text(value: object) -> str:
     return str(value).encode("utf-8", "replace").decode()
 
 
-def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
-    budget_store.get_tracker().record(
-        LedgerEntry(
-            time=datetime.now(UTC),
-            source=source,
-            session_id=session_id,
-            label=label,
-            outcome=ledger_outcome(guard),
-            cost_gbp=guard.cost_gbp,
-        )
-    )
-
-
 async def _arecord(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
     await budget_store.get_tracker().arecord(
         LedgerEntry(
@@ -191,6 +178,13 @@ async def execute_guarded(
 
     try:
         await budget_store.get_tracker().acheck_budget(session_id)
+    except asyncio.CancelledError:
+        # The call may already be charged: record the verdict before stopping.
+        try:
+            await _arecord(session_id, source, label, guard)
+        except Exception:
+            logger.exception("ledger update failed")
+        raise
     except Exception:
         guard = ledger_error(guard)
     try:

@@ -82,14 +82,14 @@ class MemoryTracker:
             is_exceeded=self.is_exceeded_flag,
         )
 
-    def reserve(self, session_id: str, estimate_gbp: float) -> str | None:
+    def reserve(self, session_id: str, estimate_gbp: float, *, rates, ttl_sec) -> str | None:
         if self.reserve_fail or self.is_exceeded_flag:
             return None
         res_id = f"res_{len(self.reservations) + 1}"
         self.reservations.append(res_id)
         return res_id
 
-    def commit(self, reservation_id: str, usage: TokenUsage, rates) -> CommitResult:
+    def commit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
         self.commits.append((reservation_id, usage))
         return CommitResult(cost_gbp=0.0001, budget=self.check_budget("stub"))
 
@@ -107,17 +107,17 @@ class MemoryTracker:
     def record(self, entry: LedgerEntry) -> None:
         self.entries.append(entry)
 
-    def recent_entries(self, limit: int = 50) -> list[LedgerEntry]:
+    def recent_entries(self, limit: int = 50, client_id: str | None = None) -> list[LedgerEntry]:
         return self.entries[-limit:] if limit > 0 else []
 
     async def acheck_budget(self, session_id: str) -> BudgetStatus:
         return self.check_budget(session_id)
 
-    async def areserve(self, session_id: str, estimate_gbp: float, *, rates=None, ttl_sec=None) -> str | None:
-        return self.reserve(session_id, estimate_gbp)
+    async def areserve(self, session_id: str, estimate_gbp: float, *, rates, ttl_sec) -> str | None:
+        return self.reserve(session_id, estimate_gbp, rates=rates, ttl_sec=ttl_sec)
 
-    async def acommit(self, reservation_id: str, usage: TokenUsage, rates=None) -> CommitResult:
-        return self.commit(reservation_id, usage, rates)
+    async def acommit(self, reservation_id: str, usage: TokenUsage) -> CommitResult:
+        return self.commit(reservation_id, usage)
 
     async def arelease(self, reservation_id: str) -> None:
         self.release(reservation_id)
@@ -132,7 +132,7 @@ class MemoryTracker:
         self.record(entry)
 
     async def arecent_entries(self, limit: int = 50, client_id: str | None = None) -> list[LedgerEntry]:
-        return self.recent_entries(limit=limit)
+        return self.recent_entries(limit=limit, client_id=client_id)
 
 
 @pytest.fixture(autouse=True)
@@ -974,9 +974,9 @@ async def test_mcp_tracker_failure_returns_sanitized_block(monkeypatch):
     def broken_get_tracker():
         raise RuntimeError("database locked")
 
-    monkeypatch.setattr(budget_store, "get_tracker", broken_get_tracker)
-
     async with lifespan(app):
+        # Broken after startup: a ledger that cannot open stops startup itself.
+        monkeypatch.setattr(budget_store, "get_tracker", broken_get_tracker)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1", follow_redirects=True) as http_client:
             async with streamable_http_client("http://127.0.0.1/mcp", http_client=http_client) as (read_stream, write_stream, _):

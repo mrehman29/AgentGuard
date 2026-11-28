@@ -1,259 +1,254 @@
-"""Tests for retention policy: verifying caps and spend never change after pruning."""
+"""Retention, client accounting and cap arithmetic (#41 AC3 and the #33 contract)."""
 
-import asyncio
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 
 from core import budget_store
-from core.schemas import LedgerEntry, ModelRates, TokenUsage
+from core.config import PROJECT_ROOT
+from core.schemas import LedgerEntry
+from storage_helpers import RATES, USAGE, query, reserve, use_database
 
-RATES = ModelRates(
-    provider="gemini",
-    model="gemini-3.5-flash-lite",
-    input_cost_per_1m_usd=0.30,
-    output_cost_per_1m_usd=2.50,
-    usd_to_gbp=0.80,
-)
+OLD = 10 * 86400
+
+
+@pytest.fixture(autouse=True)
+def database(monkeypatch, tmp_path):
+    for name in ("SESSION_BUDGET_CAP_GBP", "GLOBAL_BUDGET_CAP_GBP", "CLIENT_BUDGET_CAP_GBP",
+                 "LEDGER_RETENTION_DAYS"):
+        monkeypatch.delenv(name, raising=False)
+    path = tmp_path / "ledger.db"
+    use_database(monkeypatch, path)
+    return path
 
 
 @pytest.fixture
-def clean_tracker(tmp_path, monkeypatch):
-    db_file = tmp_path / "retention_test.db"
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
-    monkeypatch.setenv("LEDGER_RETENTION_DAYS", "0")
-    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.10")
-    monkeypatch.setattr(budget_store, "_tracker", None)
+def tracker():
     return budget_store.get_tracker()
 
 
-def test_retention_preserves_caps_and_status(clean_tracker):
-    tracker = clean_tracker
-    session_id = "test-retention"
+def spend(tracker, session_id, amount=0.001):
+    return tracker.commit(reserve(tracker, session_id, amount), USAGE)
 
-    # 1. Spend in session
-    res_1 = tracker.reserve(session_id, 0.010, rates=RATES, ttl_sec=60.0)
-    commit_1 = tracker.commit(
-        res_1,
-        TokenUsage(prompt_tokens=400, candidates_tokens=100, thoughts_tokens=20),
-    )
-    spent_1 = commit_1.cost_gbp
 
-    res_2 = tracker.reserve(session_id, 0.010, rates=RATES, ttl_sec=60.0)
-    commit_2 = tracker.commit(
-        res_2,
-        TokenUsage(prompt_tokens=300, candidates_tokens=80, thoughts_tokens=10),
-    )
-    spent_2 = commit_2.cost_gbp
-
-    # Live committable reservation that should NOT be pruned
-    live_res = tracker.reserve(session_id, 0.005, rates=RATES, ttl_sec=3600.0)
-    assert live_res is not None
-
-    # Record entries: one legacy (created_at = 0), one old, one recent
-    tracker.record(
-        LedgerEntry(
-            time=datetime.now(UTC) - timedelta(days=45),
-            source="web",
-            session_id=session_id,
-            label="old-run",
-            outcome="ALLOW",
-            cost_gbp=spent_1,
-        )
-    )
-    tracker.record(
-        LedgerEntry(
-            time=datetime.now(UTC),
-            source="web",
-            session_id=session_id,
-            label="recent-run",
-            outcome="ALLOW",
-            cost_gbp=spent_2,
-        )
-    )
-
-    # Insert a legacy entry with created_at = 0.0
-    conn = tracker._connect()
-    try:
+def age(path, seconds=OLD):
+    conn = sqlite3.connect(path)
+    for table in ("usage", "entries"):
         conn.execute(
-            "INSERT INTO entries (entry, created_at, client_id) VALUES (?, 0.0, NULL)",
-            ('{"label": "legacy"}',),
+            f"UPDATE {table} SET created_at = created_at - ? WHERE created_at > 0", (seconds,)
         )
-        # Age the first usage row to 45 days ago
-        old_timestamp = time.time() - (45 * 86400)
-        cursor = conn.execute("SELECT id FROM usage ORDER BY id ASC LIMIT 1")
-        (first_id,) = cursor.fetchone()
-        conn.execute("UPDATE usage SET created_at = ? WHERE id = ?", (old_timestamp, first_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Capture status before retention
-    status_before = tracker.check_budget(session_id)
-
-    # Run retention pruning (30 days window)
-    stats = tracker.apply_retention(retention_days=30)
-    assert stats.usage_pruned == 1
-    assert stats.entries_pruned == 1  # only the 45-day-old entry pruned; legacy and recent kept!
-    assert stats.reservations_pruned == 0  # live reservation kept!
-
-    # Check status after retention
-    status_after = tracker.check_budget(session_id)
-    assert status_after.spent_gbp == status_before.spent_gbp
-    assert status_after.total_tokens == status_before.total_tokens
-    assert status_after.prompt_tokens == status_before.prompt_tokens
-    assert status_after.candidates_tokens == status_before.candidates_tokens
-    assert status_after.thoughts_tokens == status_before.thoughts_tokens
-    assert status_after.reserved_gbp == status_before.reserved_gbp
-    assert status_after.remaining_gbp == status_before.remaining_gbp
-    assert status_after.global_spent_gbp == status_before.global_spent_gbp
-    assert status_after.is_exceeded == status_before.is_exceeded
-
-    # Verify summary row is inside usage with created_at = 0.0
-    conn = tracker._connect()
-    try:
-        row = conn.execute("SELECT created_at, cost_gbp FROM usage WHERE created_at = 0.0").fetchone()
-        assert row is not None
-        assert abs(row[1] - spent_1) < 1e-9
-
-        # Verify legacy entry is still present
-        (legacy_count,) = conn.execute("SELECT count(*) FROM entries WHERE created_at = 0.0").fetchone()
-        assert legacy_count == 1
-
-        # Verify live reservation is still present and committable
-        res_row = conn.execute("SELECT id FROM reservations WHERE id = ?", (live_res,)).fetchone()
-        assert res_row is not None
-    finally:
-        conn.close()
-
-    # Commit live reservation after retention succeeds!
-    commit_live = tracker.commit(live_res, TokenUsage(prompt_tokens=50, candidates_tokens=10, thoughts_tokens=0))
-    assert commit_live.cost_gbp > 0
+    conn.commit()
+    conn.close()
 
 
-def test_retention_cap_invariance_3000_sessions(clean_tracker):
-    """AC3: Cap invariance across 3,000 sessions (identical is_exceeded results)."""
-    tracker = clean_tracker
-    conn = tracker._connect()
-
-    old_ts = time.time() - (40 * 86400)
-    now_ts = time.time()
-
-    # Insert 3,000 sessions with varying spend and caps
-    # Some exceeded, some close to boundary
-    cap_val = 0.05
-    sessions_to_test = []
-
-    usage_inserts = []
-    caps_inserts = []
-
-    for i in range(3000):
-        s_id = f"bulk-sess-{i}"
-        client_id = f"client-{i % 10}"
-        key = budget_store.session_key(client_id, s_id)
-
-        # Diverse costs to test boundary conditions
-        cost1 = 0.01 + (i % 50) * 0.0008
-        cost2 = 0.005 + (i % 25) * 0.0004
-        # Session cap
-        caps_inserts.append((key, cap_val))
-
-        # Two usage rows: one old (will be pruned), one recent
-        usage_inserts.append((key, client_id, 100, 50, 10, cost1, 0, old_ts))
-        usage_inserts.append((key, client_id, 50, 20, 5, cost2, 0, now_ts))
-
-        if i < 100 or i % 30 == 0:
-            sessions_to_test.append(key)
-
-    conn.executemany("INSERT INTO session_caps (session_id, cap_gbp) VALUES (?, ?)", caps_inserts)
+def add_usage(path, rows):
+    """rows: (session_id, client_id, cost, created_at)"""
+    conn = sqlite3.connect(path)
     conn.executemany(
-        "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens, thoughts_tokens, cost_gbp, cleared, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        usage_inserts,
+        "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens,"
+        " thoughts_tokens, cost_gbp, created_at) VALUES (?, ?, 1, 1, 1, ?, ?)", rows
     )
     conn.commit()
     conn.close()
 
-    # Capture status before
-    statuses_before = {s: tracker.check_budget(s) for s in sessions_to_test}
 
-    # Apply retention
-    stats = tracker.apply_retention(retention_days=30)
-    assert stats.usage_pruned == 3000
-
-    # Capture status after
-    statuses_after = {s: tracker.check_budget(s) for s in sessions_to_test}
-
-    for s in sessions_to_test:
-        sb = statuses_before[s]
-        sa = statuses_after[s]
-        assert abs(sb.spent_gbp - sa.spent_gbp) < 1e-9
-        assert sb.is_exceeded == sa.is_exceeded, f"is_exceeded changed for {s}: {sb.is_exceeded} vs {sa.is_exceeded}"
-        assert abs(sb.remaining_gbp - sa.remaining_gbp) < 1e-9
-
-
-def test_retention_cli_days_flag(tmp_path, monkeypatch):
-    """Test CLI prune with --days flag."""
-    db_file = tmp_path / "cli_retention.db"
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
-    monkeypatch.setattr(budget_store, "_tracker", None)
-    tracker = budget_store.get_tracker()
-
-    # Seed data
-    r = tracker.reserve("sess-cli", 0.005, rates=RATES, ttl_sec=60.0)
-    tracker.commit(r, TokenUsage(prompt_tokens=100, candidates_tokens=50, thoughts_tokens=0))
-
-    # Age usage row
-    conn = tracker._connect()
-    try:
-        conn.execute("UPDATE usage SET created_at = ?", (time.time() - (45 * 86400),))
-        conn.commit()
-    finally:
-        conn.close()
-
-    res = subprocess.run(
-        [sys.executable, "-m", "core.storage", "prune", "--db", str(db_file), "--days", "30"],
-        capture_output=True,
-        text=True,
+def entry(session_id, label="screen"):
+    return LedgerEntry(
+        time="2026-01-01T00:00:00Z", source="web", session_id=session_id,
+        label=label, outcome="OK", cost_gbp=0,
     )
-    assert res.returncode == 0
-    assert "Pruned" in res.stdout
-    assert "1 usage rows" in res.stdout
 
 
-@pytest.mark.asyncio
-async def test_async_retention_and_reset(clean_tracker):
-    async with asyncio.timeout(10.0):
-        tracker = clean_tracker
-        session_id = "test-async-retention"
+def test_an_expired_reservation_survives_pruning_and_a_late_commit(tracker, monkeypatch):
+    held = reserve(tracker, "late", 0.001, ttl_sec=0.01)
+    time.sleep(0.05)
+    assert tracker.check_budget("late").reserved_gbp == 0
+    tracker.apply_retention(1)
+    assert tracker.commit(held, USAGE).cost_gbp > 0
+    assert tracker.check_budget("late").spent_gbp > 0
 
-        res = await tracker.areserve(session_id, 0.010, rates=RATES, ttl_sec=60.0)
-        await tracker.acommit(
-            res,
-            TokenUsage(prompt_tokens=200, candidates_tokens=50, thoughts_tokens=10),
-        )
 
-        # Age usage row
-        conn = tracker._connect()
-        try:
-            old_timestamp = time.time() - (40 * 86400)
-            conn.execute("UPDATE usage SET created_at = ?", (old_timestamp,))
-            conn.commit()
-        finally:
-            conn.close()
+def test_caps_are_unchanged_across_three_thousand_sessions(tracker, database, monkeypatch):
+    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.0001")
+    monkeypatch.setenv("SESSION_BUDGET_CAP_GBP", "0.3")
+    monkeypatch.setenv("GLOBAL_BUDGET_CAP_GBP", "1000")
+    old = time.time() - OLD
+    costs = [0.0000137, 0.0000091, 0.0000203]
+    rows = []
+    for index in range(3000):
+        client = f"c{index % 100}" if index % 2 else None
+        session = budget_store.session_key(client, f"s{index}")
+        rows += [(session, client, cost * (1 + index % 7), old) for cost in costs]
+    add_usage(database, rows)
+    # One session exactly at its cap, on values whose float sum is inexact.
+    tracker.set_session_cap("edge", 0.3)
+    add_usage(database, [("edge", None, 0.1, old), ("edge", None, 0.2, old)])
+    sessions = ["edge"] + [row[0] for row in rows[::3]]
 
-        status_before = await tracker.acheck_budget(session_id)
-        await tracker.aapply_retention(retention_days=30)
-        status_after = await tracker.acheck_budget(session_id)
+    def results():
+        return [
+            (s.is_exceeded, *(None if v is None else budget_store.to_nano(v) for v in (
+                s.spent_gbp, s.remaining_gbp, s.client_spent_gbp, s.client_cap_gbp,
+                s.global_spent_gbp)))
+            for s in map(tracker.check_budget, sessions)
+        ]
 
-        assert status_after.spent_gbp == status_before.spent_gbp
-        assert status_after.global_spent_gbp == status_before.global_spent_gbp
+    before = results()
+    assert before[0][0] and any(not r[0] for r in before)
+    assert any(r[0] and r[3] is not None for r in before)  # a client at its cap
+    stats = tracker.apply_retention(5)
+    assert stats.usage_pruned == 9002
+    assert query(database, "SELECT COUNT(*) FROM usage") == [(3001,)]
+    assert results() == before
 
-        # Reset session: session spend should be cleared, but global spend must persist!
-        reset_status = await tracker.areset(session_id)
-        assert reset_status.spent_gbp == 0.0
-        assert reset_status.global_spent_gbp == status_before.global_spent_gbp
+
+def test_repeated_pruning_keeps_one_summary_per_group_and_legacy_rows(tracker, database):
+    add_usage(database, [("s", None, 0.01, 0.0)])  # a legacy row
+    for _ in range(4):
+        spend(tracker, "s")
+        spend(tracker, "k:s")
+        age(database)
+        before = tracker.check_budget("s"), tracker.check_budget("k:s")
+        stats = tracker.apply_retention(5)
+        assert stats.usage_pruned == 2 and stats.cost_archived_gbp > 0
+        assert (tracker.check_budget("s"), tracker.check_budget("k:s")) == before
+        assert query(database, "SELECT COUNT(*) FROM usage WHERE summary = 1") == [(2,)]
+    assert query(database, "SELECT cost_gbp FROM usage WHERE summary = 0") == [(0.01,)]
+    assert tracker.apply_retention(5).usage_pruned == 0
+    # A reset clears the summary; the next prune keeps cleared spend global only.
+    tracker.reset("s")
+    spend(tracker, "s")
+    age(database)
+    before = tracker.check_budget("s")
+    tracker.apply_retention(5)
+    assert tracker.check_budget("s") == before
+
+
+def test_old_entries_are_pruned_and_recent_ones_kept(tracker):
+    tracker.record(entry("s", "old"))
+    recent = entry("s", "new").model_copy(update={"time": datetime.now(UTC)})
+    tracker.record(recent)
+    assert tracker.apply_retention(0).entries_pruned == 0
+    assert tracker.apply_retention(30).entries_pruned == 1
+    assert [e.label for e in tracker.recent_entries()] == ["new"]
+
+
+def test_retention_keeps_the_client_cap(tracker, database, monkeypatch):
+    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.002")
+    add_usage(database, [("k:a", "k", 0.001, time.time() - OLD), ("k:b", "k", 0.001, time.time() - OLD)])
+    before = tracker.check_budget("k:new")
+    assert before.is_exceeded and before.client_spent_gbp == 0.002
+    tracker.apply_retention(5)
+    assert tracker.check_budget("k:new") == before
+    assert reserve(tracker, "k:new", 0.0001) is None
+
+
+def test_reset_client_removes_only_that_clients_caps(tracker):
+    untouched = ["a_b", "axb:s", "A_B:s", "a%:s"]
+    for key in [*untouched, "a_b:s", "a_b:t"]:
+        tracker.set_session_cap(key, 0.001)
+    tracker.reset_client("a_b")
+    assert [tracker.check_budget(k).cap_gbp for k in ("a_b:s", "a_b:t")] == [0.05, 0.05]
+    assert [tracker.check_budget(k).cap_gbp for k in untouched] == [0.001] * 4
+    tracker.reset_client("a%")
+    assert [tracker.check_budget(k).cap_gbp for k in untouched] == [0.001, 0.001, 0.001, 0.05]
+
+
+def test_client_reset_keeps_live_reservations_and_global_spend(tracker):
+    spend(tracker, "k:a")
+    live = reserve(tracker, "k:b", 0.001)
+    total = tracker.check_budget("x").global_spent_gbp
+    tracker.reset_client("k")
+    status = tracker.check_budget("k:b")
+    assert (status.client_spent_gbp, status.client_reserved_gbp) == (0, 0.001)
+    assert status.global_spent_gbp == total > 0
+    tracker.commit(live, USAGE)
+
+
+def test_session_reset_lowers_client_spend_but_not_global(tracker, monkeypatch):
+    """Intended: only an administrator may reset (enforced by #33's routes)."""
+    spend(tracker, "k:a")
+    spend(tracker, "k:b")
+    before = tracker.check_budget("k:a")
+    tracker.reset("k:a")
+    after = tracker.check_budget("k:a")
+    assert after.client_spent_gbp == pytest.approx(before.client_spent_gbp / 2)
+    assert after.global_spent_gbp == before.global_spent_gbp
+
+
+def test_ledger_filtered_by_client(tracker):
+    for session in ("k:a", "other:a", "k", "k:*", "k_:a"):
+        tracker.record(entry(session))
+    assert [e.session_id for e in tracker.recent_entries(client_id="k")] == ["k:a", "k:*"]
+    assert [e.session_id for e in tracker.recent_entries(1, client_id="k")] == ["k:*"]
+    assert len(tracker.recent_entries()) == 5
+
+
+@pytest.mark.parametrize(
+    "estimate,admitted",
+    [(0.2, True), (0.2 + 1e-9, False), (0.2 + 4e-7, False)],
+)
+def test_cap_on_a_rounding_boundary(tracker, database, monkeypatch, estimate, admitted):
+    monkeypatch.setenv("SESSION_BUDGET_CAP_GBP", "0.5")
+    tracker.set_session_cap("s", 0.3)
+    add_usage(database, [("s", None, 0.1, time.time())])
+    assert 0.1 + 0.2 > 0.3  # float arithmetic alone would refuse the first case
+    assert tracker.check_budget("s").cap_gbp == 0.3
+    assert (reserve(tracker, "s", estimate) is not None) is admitted
+
+
+def test_reserve_requires_rates_and_a_lifetime(tracker):
+    with pytest.raises(TypeError):
+        tracker.reserve("s", 0.001, ttl_sec=60)
+    with pytest.raises(TypeError):
+        tracker.reserve("s", 0.001, rates=RATES)
+    with pytest.raises(ValueError):
+        tracker.reserve("s", 0.001, rates=RATES, ttl_sec=float("nan"))
+
+
+async def test_async_reserve_has_no_fallback(tracker, monkeypatch):
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise TypeError("a real bug")
+
+    monkeypatch.setattr(tracker, "reserve", broken)
+    with pytest.raises(TypeError, match="a real bug"):
+        await tracker.areserve("s", 0.001, rates=RATES, ttl_sec=60)
+    assert len(calls) == 1
+
+
+def cli(*args):
+    return subprocess.run(
+        [sys.executable, "-m", "core.storage", *args],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_prune_command(tracker, database):
+    spend(tracker, "s")
+    age(database)
+    result = cli("prune", "--db", str(database), "--days", "5")
+    assert result.returncode == 0 and "1 usage rows" in result.stdout, result.stderr
+    off = cli("prune", "--db", str(database), "--days", "0")
+    assert off.returncode == 0 and "Retention is off" in off.stdout
+
+
+@pytest.mark.parametrize("command", [["prune", "--days", "5"], ["migrate"]])
+def test_commands_refuse_a_path_that_is_not_a_ledger(tmp_path, command):
+    missing = tmp_path / "mistyped.db"
+    result = cli(*command, "--db", str(missing))
+    assert result.returncode == 1 and "does not exist" in result.stderr
+    assert not missing.exists()
+    other = tmp_path / "other.db"
+    conn = sqlite3.connect(other)
+    conn.execute("CREATE TABLE unrelated (x)")
+    conn.close()
+    result = cli(*command, "--db", str(other))
+    assert result.returncode == 1 and "Not an AgentGuard ledger" in result.stderr
+    assert query(other, "SELECT name FROM sqlite_master") == [("unrelated",)]

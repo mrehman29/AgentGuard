@@ -1,247 +1,343 @@
-"""Load test demonstrating non-blocking event loop and strict cap enforcement under concurrency."""
+"""Ledger access off the event loop, and exact caps under concurrency (#41 AC1)."""
 
 import asyncio
-import multiprocessing
+import json
 import os
+import socket
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
-from datetime import UTC, datetime
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 import pytest
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
-from app.main import app
-from app.mcp_server import guard_check_action, guard_get_budget_status
+from app.main import app, lifespan
 from core import budget_store
-from core.schemas import LedgerEntry, ModelRates, TokenUsage
+from core.config import PROJECT_ROOT, get_settings, token_cost_gbp
+from core.schemas import LedgerEntry
+from storage_helpers import create_ledger, reserve, use_database, write_lock
 
-RATES = ModelRates(
-    provider="gemini",
-    model="gemini-3.5-flash-lite",
-    input_cost_per_1m_usd=0.30,
-    output_cost_per_1m_usd=2.50,
-    usd_to_gbp=0.80,
-)
+SERVER = Path(__file__).parent / "storage_server.py"
+LAG_BOUND_MS = 100.0
+API = {"X-Requested-With": "AgentGuard"}
 
 
-@pytest.fixture
-def test_db(tmp_path, monkeypatch):
-    db_file = tmp_path / "concurrent_guard.db"
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
-    monkeypatch.setenv("SESSION_BUDGET_CAP_GBP", "0.020")
-    monkeypatch.setenv("GLOBAL_BUDGET_CAP_GBP", "0.050")
-    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.020")
-    monkeypatch.setattr(budget_store, "_tracker", None)
-    return budget_store.get_tracker()
+@pytest.fixture(autouse=True)
+def database(monkeypatch, tmp_path):
+    for name in ("SESSION_BUDGET_CAP_GBP", "GLOBAL_BUDGET_CAP_GBP", "CLIENT_BUDGET_CAP_GBP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+    path = tmp_path / "ledger.db"
+    use_database(monkeypatch, path)
+    return path
 
 
-@pytest.mark.asyncio
-async def test_loop_lag_under_held_write_lock_and_exact_cap_enforcement(test_db):
-    """AC1: Hold write lock for 1s on background thread while driving /api/run and /mcp.
-
-    Assert loop lag bound < 100ms, and exact integer math admits exactly 10 of 50 tasks.
-    """
-    async with asyncio.timeout(30.0):
-        tracker = test_db
-        session_id = "concurrent-sess"
-
-        # Start event loop heartbeat monitor
-        heartbeat_ticks = 0
-        max_lag_ms = 0.0
-        stop_heartbeat = asyncio.Event()
-
-        async def heartbeat_monitor():
-            nonlocal heartbeat_ticks, max_lag_ms
-            interval = 0.005  # 5ms
-            while not stop_heartbeat.is_set():
-                t0 = time.perf_counter()
-                await asyncio.sleep(interval)
-                lag = (time.perf_counter() - t0 - interval) * 1000
-                if lag > max_lag_ms:
-                    max_lag_ms = lag
-                heartbeat_ticks += 1
-
-        monitor_task = asyncio.create_task(heartbeat_monitor())
-
-        # Background thread holds BEGIN IMMEDIATE for 1.0 second
-        def hold_lock():
-            conn = sqlite3.connect(tracker._path, timeout=5.0)
-            conn.execute("BEGIN IMMEDIATE")
-            time.sleep(1.0)
-            conn.execute("ROLLBACK")
-            conn.close()
-
-        lock_thread = threading.Thread(target=hold_lock)
-        lock_thread.start()
-        # Give thread time to acquire write lock
-        await asyncio.sleep(0.05)
-
-        num_concurrent_ops = 50
-        reserve_cost_per_op = 0.002  # With cap = 0.020, exactly 10 must succeed with integer math!
-
-        successful_reservations = 0
-        rejected_reservations = 0
-        lock = asyncio.Lock()
-
-        async def web_client_worker(client: httpx.AsyncClient, worker_id: int):
-            res = await client.get(f"/api/budget/{session_id}")
-            assert res.status_code == 200
-            res2 = await client.get("/api/ledger/recent?limit=10")
-            assert res2.status_code == 200
-
-        async def mcp_client_worker(worker_id: int):
-            status = await guard_get_budget_status(session_id)
-            assert "spent_gbp" in status or "error" not in status
-
-        async def spender_worker(worker_id: int):
-            nonlocal successful_reservations, rejected_reservations
-            r_id = await tracker.areserve(
-                session_id, reserve_cost_per_op, rates=RATES, ttl_sec=60.0
-            )
-            if r_id is not None:
-                async with lock:
-                    successful_reservations += 1
-                # Commit exact 0.002 GBP: 1000 tokens * 2.50 / 1e6 * 0.80 = 0.002
-                await tracker.acommit(
-                    r_id,
-                    TokenUsage(prompt_tokens=0, candidates_tokens=1000, thoughts_tokens=0),
-                )
-                await tracker.arecord(
-                    LedgerEntry(
-                        time=datetime.now(UTC),
-                        source="web",
-                        session_id=session_id,
-                        label=f"worker-{worker_id}",
-                        outcome="ALLOW",
-                        cost_gbp=reserve_cost_per_op,
-                    )
-                )
-            else:
-                async with lock:
-                    rejected_reservations += 1
-
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
-            tasks = []
-            for i in range(num_concurrent_ops):
-                tasks.append(web_client_worker(client, i))
-                tasks.append(mcp_client_worker(i))
-                tasks.append(spender_worker(i))
-
-            await asyncio.gather(*tasks)
-
-        lock_thread.join()
-        stop_heartbeat.set()
-        await monitor_task
-
-        # Loop lag must be strictly bounded (well below the 1.0s background lock)
-        assert max_lag_ms < 150.0, f"Event loop stalled: max lag was {max_lag_ms:.2f}ms"
-        assert heartbeat_ticks > 10, f"Heartbeat stalled: ticks={heartbeat_ticks}"
-
-        # Exact cap enforcement via integer math: exactly 10 succeed, exactly 40 rejected
-        final_status = await tracker.acheck_budget(session_id)
-        assert final_status.spent_gbp <= 0.020 + 1e-9
-        assert successful_reservations == 10, f"Expected exactly 10 successes, got {successful_reservations}"
-        assert rejected_reservations == 40, f"Expected exactly 40 rejections, got {rejected_reservations}"
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
-def _worker_process_spend(db_path_str: str, client_id: str, results_queue: multiprocessing.Queue):
-    """Subprocess function simulating concurrent process using client accounting."""
-    os.environ["SQLITE_DB_PATH"] = db_path_str
-    os.environ["CLIENT_BUDGET_CAP_GBP"] = "0.010"
-    budget_store._tracker = None
-    tracker = budget_store.get_tracker()
+@contextmanager
+def server(tmp_path: Path):
+    port = free_port()
+    log = tmp_path / "server.log"
+    with log.open("w") as stream:
+        process = subprocess.Popen(
+            [sys.executable, str(SERVER), str(port)],
+            cwd=PROJECT_ROOT, stdout=stream, stderr=subprocess.STDOUT,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}"
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    httpx.get(f"{url}/__test__/state", trust_env=False, timeout=2).raise_for_status()
+                    break
+                except httpx.TransportError:
+                    assert process.poll() is None and time.monotonic() < deadline, log.read_text()
+                    time.sleep(0.05)
+            yield url
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
-    successful = 0
-    # Try 10 reserves of 0.002 GBP with unique session IDs under client_id
-    for i in range(10):
-        key = budget_store.session_key(client_id, f"sess-{os.getpid()}-{i}")
-        res = tracker.reserve(key, 0.002, rates=RATES, ttl_sec=60.0)
-        if res is not None:
-            tracker.commit(
-                res, TokenUsage(prompt_tokens=0, candidates_tokens=1000, thoughts_tokens=0)
-            )
-            tracker.record(
-                LedgerEntry(
-                    time=datetime.now(UTC),
-                    source="web",
-                    session_id=key,
-                    label="proc_spend",
-                    outcome="ALLOW",
-                    cost_gbp=0.002,
-                )
-            )
-            successful += 1
-    results_queue.put(successful)
 
-
-def test_multi_process_client_cap_and_reset(tmp_path, monkeypatch):
-    """AC1: 2 processes sharing 1 client cap (0.010 GBP), fresh session IDs, client reset."""
-    db_file = tmp_path / "client_multiprocess.db"
-    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
-    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.010")
-    monkeypatch.setattr(budget_store, "_tracker", None)
-    tracker = budget_store.get_tracker()
-
-    client_id = "client_alpha"
-    q = multiprocessing.Queue()
-
-    p1 = multiprocessing.Process(
-        target=_worker_process_spend, args=(str(db_file), client_id, q)
-    )
-    p2 = multiprocessing.Process(
-        target=_worker_process_spend, args=(str(db_file), client_id, q)
+def estimate(tool_name: str, args: dict) -> float:
+    """What the classifier reserves for this call."""
+    settings = get_settings()
+    payload = json.dumps({"tool_name": tool_name, "args": args}, ensure_ascii=False)
+    return token_cost_gbp(
+        settings.rates_for(settings.classifier),
+        settings.budget_reserve_input_tokens + len(payload.encode()),
+        settings.classifier.max_output_tokens,
     )
 
-    p1.start()
-    p2.start()
-    p1.join(timeout=10.0)
-    p2.join(timeout=10.0)
 
-    s1 = q.get()
-    s2 = q.get()
-
-    # Total successful across both processes must not exceed client cap:
-    # 0.010 / 0.002 = exactly 5 successful reserves total!
-    total_successful = s1 + s2
-    assert total_successful == 5, f"Expected 5 total successes on 0.010 cap, got {total_successful}"
-
-    # Client ledger must be filtered
-    entries = tracker.recent_entries(limit=50, client_id=client_id)
-    assert len(entries) == 5
-    for entry in entries:
-        c, _ = budget_store.split_session_key(entry.session_id)
-        assert c == client_id
-
-    # Reset client
-    tracker.reset_client(client_id)
-
-    # After reset, client spend should be 0, allowing fresh reserves
-    key = budget_store.session_key(client_id, "after_reset_sess")
-    res_after = tracker.reserve(key, 0.002, rates=RATES, ttl_sec=60.0)
-    assert res_after is not None
-    tracker.release(res_after)
+async def run(client: httpx.AsyncClient, **body) -> list[dict]:
+    response = await client.post("/api/run", json=body)
+    assert response.status_code == 200, response.text
+    return [json.loads(line) for line in response.text.splitlines() if line]
 
 
-@pytest.mark.asyncio
-async def test_event_loop_thread_checker(test_db):
-    """Ensure no sync tracker method executes directly on the asyncio event loop thread."""
-    async with asyncio.timeout(10.0):
-        tracker = test_db
-        loop_thread_id = threading.get_ident()
+async def test_real_server_under_a_write_lock_keeps_the_loop_free_and_the_caps_exact(
+    database, tmp_path
+):
+    admitted, calls = 5, 15
+    web_args = {"prompt": "add the numbers"}
+    mcp_args = {"code": "print(2)"}
+    web_cost = estimate("agent_prompt", web_args)
+    mcp_cost = estimate("execute_python", mcp_args)
+    tracker = budget_store.get_tracker()
+    # Room for exactly `admitted` classifier calls in each session.
+    tracker.set_session_cap("race-web", (admitted + 0.5) * web_cost)
+    tracker.set_session_cap("race-mcp", (admitted + 0.5) * mcp_cost)
 
-        # Wrapper to verify thread ID inside sync tracker methods
-        def check_not_on_loop_thread():
-            assert threading.get_ident() != loop_thread_id, (
-                "Sync tracker method executed directly on the asyncio event loop thread!"
-            )
+    with server(tmp_path) as url:
+        async with asyncio.timeout(60):
+            async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=30) as client:
+                async with streamable_http_client(f"{url}/mcp", http_client=client) as (r, w, _):
+                    async with ClientSession(r, w) as mcp:
+                        await mcp.initialize()
 
-        orig_reserve = tracker.reserve
-        tracker.reserve = lambda *args, **kwargs: (check_not_on_loop_thread(), orig_reserve(*args, **kwargs))[1]
+                        def check():
+                            return mcp.call_tool("guard_check_action", {
+                                "tool_name": "execute_python",
+                                "args_json": json.dumps(mcp_args),
+                                "session_id": "race-mcp",
+                            })
 
-        # Calling areserve must run on worker thread, never loop thread
-        r_id = await tracker.areserve("loop_thread_sess", 0.001, rates=RATES, ttl_sec=60.0)
-        assert r_id is not None
-        await tracker.arelease(r_id)
+                        # Warm up lazy imports, then measure only the load.
+                        await run(client, prompt="warm up", session_id="warm")
+                        await mcp.call_tool("guard_get_budget_status", {"session_id": "warm"})
+                        await client.get("/__test__/state", params={"reset": True})
+
+                        finished: list[float] = []
+
+                        async def timed(call):
+                            result = await call
+                            finished.append(time.monotonic())
+                            return result
+
+                        with write_lock(database):
+                            load = [
+                                asyncio.create_task(timed(run(client, session_id="race-web", **web_args)))
+                                for _ in range(calls)
+                            ] + [asyncio.create_task(timed(check())) for _ in range(calls)]
+                            await asyncio.sleep(1.0)
+                            released = time.monotonic()
+                        results = await asyncio.gather(*load)
+                        loaded = (await client.get("/__test__/state")).json()
+
+                        # Every other product path, for the thread check.
+                        await run(client, prompt="work", session_id="paths", budget_cap_gbp=0.04)
+                        await run(client, prompt="fail-agent", session_id="paths")
+                        await run(client, prompt="fail-classify", session_id="paths")
+                        await run(client, prompt="loop", preset="loop")
+                        await mcp.call_tool("guard_execute_sandbox", {"code": "print(3)", "session_id": "paths"})
+                        await mcp.call_tool("guard_check_action", {"tool_name": "x", "args_json": "no"})
+                        await mcp.call_tool("guard_execute_sandbox", {"code": "1", "session_id": "bad id"})
+                        await mcp.call_tool("guard_get_budget_status", {"session_id": "bad id"})
+                        await mcp.call_tool("guard_get_budget_status", {"session_id": "paths"})
+                        assert (await client.get("/api/budget/paths")).status_code == 200
+                        assert (await client.post("/api/budget/paths/reset", headers=API)).status_code == 200
+                        assert (await client.post("/api/budget/bad%20id/reset", headers=API)).status_code == 422
+                        assert (await client.get("/api/ledger/recent")).status_code == 200
+                        final = (await client.get("/__test__/state")).json()
+
+    assert min(finished) >= released, "a call finished without waiting for the write lock"
+    print(f"max loop lag under load: {loaded['max_lag_ms']:.1f} ms")
+    assert loaded["max_lag_ms"] < LAG_BOUND_MS
+    assert final["violations"] == []
+    for method in (
+        "_create_schema", "check_budget", "reserve", "commit", "release",
+        "set_session_cap", "reset", "record", "recent_entries",
+    ):
+        assert final["calls"].get(method), f"{method} was not exercised"
+
+    web, checks = results[:calls], results[calls:]
+    screens = [
+        next(e for e in events if e["type"] == "step_finished")["result"]["guard"] for events in web
+    ]
+    assert sorted(s["decision"] for s in screens) == ["ALLOW"] * admitted + ["BLOCK"] * (calls - admitted)
+    assert all(s["stage"] == "BUDGET" for s in screens if s["decision"] == "BLOCK")
+    verdicts = [c.structuredContent for c in checks]
+    assert sorted(v["decision"] for v in verdicts) == ["ALLOW"] * admitted + ["BLOCK"] * (calls - admitted)
+    assert all(v["stage"] == "BUDGET" for v in verdicts if v["decision"] == "BLOCK")
+    for session, cost in (("race-web", web_cost), ("race-mcp", mcp_cost)):
+        status = tracker.check_budget(session)
+        assert status.spent_gbp == pytest.approx(admitted * cost, abs=1e-12)
+        assert status.spent_gbp <= status.cap_gbp and status.reserved_gbp == 0
+
+
+async def test_disconnect_during_the_agent_turn_is_recorded(database, tmp_path):
+    with server(tmp_path) as url:
+        async with asyncio.timeout(30):
+            async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=20) as client:
+                body = {"prompt": "slow-agent", "session_id": "gone"}
+                async with client.stream("POST", "/api/run", json=body) as response:
+                    async for _ in response.aiter_lines():
+                        while not (await client.get("/__test__/state")).json()["agent_calls"]:
+                            await asyncio.sleep(0.02)
+                        break
+                # Leaving the block closed the connection in the middle of the turn.
+                tracker = budget_store.get_tracker()
+                for _ in range(200):
+                    entries = [e for e in tracker.recent_entries() if e.session_id == "gone"]
+                    if len(entries) == 2 and tracker.check_budget("gone").reserved_gbp == 0:
+                        break
+                    await asyncio.sleep(0.02)
+    assert [(e.label, e.outcome) for e in entries] == [("screen", "ALLOW"), ("agent turn", "ERROR")]
+    assert entries[1].cost_gbp == 0
+    assert tracker.check_budget("gone").reserved_gbp == 0
+
+
+def test_server_does_not_start_on_a_newer_schema(database, tmp_path):
+    create_ledger(database, "s")
+    conn = sqlite3.connect(database)
+    conn.execute("PRAGMA user_version = 9")
+    conn.close()
+    process = subprocess.run(
+        [sys.executable, str(SERVER), str(free_port())],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert process.returncode != 0
+    assert "newer than supported" in process.stderr
+
+
+async def test_startup_opens_the_ledger_once_and_off_the_loop(database, monkeypatch):
+    create_ledger(database, "s")
+    threads = []
+    real = budget_store.SessionBudgetTracker._create_schema
+
+    def spy(self):
+        threads.append(threading.current_thread())
+        real(self)
+
+    monkeypatch.setattr(budget_store.SessionBudgetTracker, "_create_schema", spy)
+    lag = 0.0
+
+    async def watch():
+        nonlocal lag
+        while True:
+            start = time.perf_counter()
+            await asyncio.sleep(0.005)
+            lag = max(lag, time.perf_counter() - start - 0.005)
+
+    async with asyncio.timeout(20):
+        watcher = asyncio.create_task(watch())
+        await asyncio.sleep(0.02)
+        held = threading.Event()
+
+        def hold():
+            with write_lock(database):
+                held.set()
+                time.sleep(0.8)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        held.wait(5)
+        async with lifespan(app):
+            watcher.cancel()
+        holder.join()
+    assert len(threads) == 1 and threads[0] is not threading.main_thread()
+    assert lag < LAG_BOUND_MS / 1000
+
+
+async def test_startup_fails_when_the_ledger_cannot_open(database, monkeypatch):
+    def broken(self):
+        raise ValueError("cannot open")
+
+    monkeypatch.setattr(budget_store.SessionBudgetTracker, "_create_schema", broken)
+    with pytest.raises(ValueError, match="cannot open"):
+        async with lifespan(app):
+            pass
+
+
+def test_threads_share_one_tracker(monkeypatch):
+    real = budget_store.SessionBudgetTracker._create_schema
+    built = []
+
+    def slow(self):
+        built.append(self)
+        time.sleep(0.1)
+        real(self)
+
+    monkeypatch.setattr(budget_store.SessionBudgetTracker, "_create_schema", slow)
+    seen = []
+    threads = [threading.Thread(target=lambda: seen.append(budget_store.get_tracker())) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert len(built) == 1 and len(set(map(id, seen))) == 1
+
+
+async def test_reads_complete_while_writes_wait_for_the_lock(database):
+    tracker = budget_store.get_tracker()
+    entry = LedgerEntry(
+        time="2026-11-28T00:00:00Z", source="web", session_id="r",
+        label="screen", outcome="ALLOW", cost_gbp=0,
+    )
+    async with asyncio.timeout(20):
+        with write_lock(database):
+            # More writes than the writer pool has threads.
+            writes = [asyncio.create_task(tracker.arecord(entry)) for _ in range(12)]
+            await asyncio.sleep(0.2)
+            async with asyncio.timeout(1.0):
+                await tracker.acheck_budget("r")
+                await tracker.arecent_entries()
+                await tracker.arecent_entries(client_id="someone")
+            assert not any(w.done() for w in writes)
+        await asyncio.gather(*writes)
+
+
+def test_two_processes_share_one_client_cap(monkeypatch, database):
+    monkeypatch.setenv("CLIENT_BUDGET_CAP_GBP", "0.01")
+    tracker = budget_store.get_tracker()
+    code = """
+import sys, uuid
+from core import budget_store
+from core.schemas import ModelRates, TokenUsage
+rates = ModelRates(provider="g", model="m", input_cost_per_1m_usd=1, output_cost_per_1m_usd=1, usd_to_gbp=1)
+tracker = budget_store.SessionBudgetTracker()
+admitted = 0
+for _ in range(20):
+    key = budget_store.session_key("acme", uuid.uuid4().hex)
+    held = tracker.reserve(key, 0.001, rates=rates, ttl_sec=60)
+    if held:
+        tracker.commit(held, TokenUsage(prompt_tokens=1000, candidates_tokens=0))
+        admitted += 1
+print(admitted)
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", code], cwd=PROJECT_ROOT, stdout=subprocess.PIPE, text=True,
+            env=os.environ,
+        )
+        for _ in range(2)
+    ]
+    totals = [int(p.communicate(timeout=60)[0]) for p in processes]
+    assert sum(totals) == 10
+    status = tracker.check_budget("acme:fresh")
+    assert status.client_spent_gbp == pytest.approx(0.01) and status.is_exceeded
+    assert reserve(tracker, "acme:fresh", 0.001) is None
+    assert reserve(tracker, "fresh", 0.001) is not None  # a local session has no client cap
+
+
+def test_product_modules_keep_no_unused_ledger_wrappers():
+    from app import mcp_server
+    from core import guard_core, pipeline
+
+    assert not hasattr(pipeline, "_record") and not hasattr(guard_core, "_record")
+    assert not hasattr(mcp_server, "_arecord")

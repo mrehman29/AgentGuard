@@ -326,19 +326,6 @@ def _budget_block(reason: str, gates_passed: list[Stage], start: float) -> Guard
     )
 
 
-def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
-    budget_store.get_tracker().record(
-        LedgerEntry(
-            time=datetime.now(UTC),
-            source=source,
-            session_id=session_id,
-            label=label,
-            outcome=ledger_outcome(guard),
-            cost_gbp=guard.cost_gbp,
-        )
-    )
-
-
 async def _arecord(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
     await budget_store.get_tracker().arecord(
         LedgerEntry(
@@ -396,7 +383,7 @@ async def _classify(
         # Charge for the call before judging its output: bad output still costs.
         # Commit outside timeout so Python 3.11 timeout does not convert CommitCancelled
         try:
-            commit_res = await tracker.acommit(reservation, reply.usage, rates=rates)
+            commit_res = await tracker.acommit(reservation, reply.usage)
             cost = commit_res.cost_gbp
             reservation = None
         except CommitCancelled as exc:

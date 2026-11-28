@@ -1,15 +1,19 @@
 """Storage management for AgentGuard: schema migrations, retention, and backups."""
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,22 @@ _V1_SCHEMA = (
     )""",
 )
 
+# Columns added by schema v2. The rate columns are nullable with no default: NULL
+# marks a reservation made before v2, and zero is a rate like any other.
+_V2_COLUMNS = (
+    ("usage", "created_at", "REAL NOT NULL DEFAULT 0.0"),
+    ("usage", "client_id", "TEXT DEFAULT NULL"),
+    ("usage", "summary", "INTEGER NOT NULL DEFAULT 0"),
+    ("entries", "created_at", "REAL NOT NULL DEFAULT 0.0"),
+    ("entries", "client_id", "TEXT DEFAULT NULL"),
+    ("reservations", "client_id", "TEXT DEFAULT NULL"),
+    ("reservations", "input_cost_per_1m_usd", "REAL"),
+    ("reservations", "output_cost_per_1m_usd", "REAL"),
+    ("reservations", "usd_to_gbp", "REAL"),
+)
+
+_RATE_COLUMNS = ("input_cost_per_1m_usd", "output_cost_per_1m_usd", "usd_to_gbp")
+
 _V2_INDEXES = (
     "CREATE INDEX IF NOT EXISTS usage_session ON usage (session_id, cleared)",
     "CREATE INDEX IF NOT EXISTS usage_client ON usage (client_id, cleared)",
@@ -52,13 +72,70 @@ _V2_INDEXES = (
     "CREATE INDEX IF NOT EXISTS reservations_expires_at ON reservations (expires_at)",
 )
 
+# What a restorable backup must hold. Version 0 and 1 are the v1.0 layout.
+_BASE_COLUMNS = {
+    "usage": {
+        "id", "session_id", "prompt_tokens", "candidates_tokens",
+        "thoughts_tokens", "cost_gbp", "cleared",
+    },
+    "reservations": {"id", "session_id", "amount_gbp", "expires_at"},
+    "session_caps": {"session_id", "cap_gbp"},
+    "entries": {"id", "entry"},
+}
+
+_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+class LedgerInUse(RuntimeError):
+    """Another process holds the ledger, or it is being restored."""
+
 
 @dataclass(frozen=True)
 class RetentionStats:
     entries_pruned: int
     usage_pruned: int
     cost_archived_gbp: float
-    reservations_pruned: int
+
+
+def lock_path(db_path: Path | str) -> Path:
+    path = Path(db_path).resolve()
+    return path.with_name(f"{path.name}.lock")
+
+
+def acquire_ledger_lock(db_path: Path | str, *, exclusive: bool = False, timeout: float = 0.0) -> int:
+    """Lock the ledger's lock file and return its descriptor. Closing it unlocks.
+
+    Every user of a ledger holds it shared for as long as it has the ledger open;
+    restore holds it exclusive. The file is never deleted: that would let two
+    processes lock different files.
+    """
+    fd = os.open(lock_path(db_path), os.O_RDWR | os.O_CREAT, 0o600)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                holder = "another process" if exclusive else "a restore"
+                raise LedgerInUse(
+                    f"Ledger is currently locked by a running process ({holder}): {db_path}"
+                ) from None
+            time.sleep(0.02)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+@contextmanager
+def ledger_lock(db_path: Path | str, *, exclusive: bool = False, timeout: float = 0.0) -> Iterator[None]:
+    fd = acquire_ledger_lock(db_path, exclusive=exclusive, timeout=timeout)
+    try:
+        yield
+    finally:
+        os.close(fd)
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
@@ -74,31 +151,128 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
-    cursor = conn.execute(f"PRAGMA table_info({table_name})")
-    return any(row[1] == column_name for row in cursor.fetchall())
+def _columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
 
 
 def _get_db_file_path(conn: sqlite3.Connection) -> Path | None:
-    try:
-        cursor = conn.execute("PRAGMA database_list")
-        for row in cursor.fetchall():
-            if row[1] == "main" and row[2]:
-                path = Path(row[2])
-                if path.is_file():
-                    return path
-    except Exception:
-        pass
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main" and row[2]:
+            return Path(row[2])
     return None
+
+
+def _private_temp(dest: Path) -> Path:
+    """A new empty file beside dest, readable by its owner only from the start."""
+    tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}_{time.time_ns()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # whatever the umask
+    finally:
+        os.close(fd)
+    return tmp
+
+
+def _remove_sidecars(db_path: Path) -> None:
+    """A journal left beside a replaced database would be applied to the new file."""
+    for suffix in _SIDECARS:
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+
+
+def _copy_database(source: sqlite3.Connection, target: sqlite3.Connection) -> None:
+    source.backup(target)
+
+
+def _snapshot(source: sqlite3.Connection, dest: Path, *, overwrite: bool) -> None:
+    """Write a complete copy of source to dest, which appears all at once, mode 0600.
+
+    Without overwrite, an existing dest raises FileExistsError and is untouched.
+    """
+    if not overwrite and dest.exists():
+        raise FileExistsError(f"File already exists and will not be overwritten: {dest}")
+    tmp = _private_temp(dest)
+    try:
+        target = sqlite3.connect(tmp, timeout=10.0)
+        try:
+            _copy_database(source, target)
+        finally:
+            target.close()
+        if overwrite:
+            _remove_sidecars(dest)
+            os.replace(tmp, dest)
+        else:
+            if not dest.exists():
+                _remove_sidecars(dest)
+            os.link(tmp, dest)  # atomic, and fails if dest exists
+    finally:
+        tmp.unlink(missing_ok=True)
+        _remove_sidecars(tmp)
+
+
+def _backup_before_upgrade(db_file: Path) -> Path:
+    """Copy the database to <db>.v1.bak, or to a new name if that one is taken."""
+    bak_path = db_file.with_name(f"{db_file.name}.v1.bak")
+    # A second connection: backing up from the one holding BEGIN IMMEDIATE deadlocks.
+    source = sqlite3.connect(db_file, timeout=10.0)
+    try:
+        try:
+            _snapshot(source, bak_path, overwrite=False)
+        except FileExistsError:
+            bak_path = db_file.with_name(f"{db_file.name}.v1.bak.{time.time_ns()}")
+            _snapshot(source, bak_path, overwrite=False)
+    finally:
+        source.close()
+    logger.warning("backed up the ledger to %s before upgrading it", bak_path)
+    return bak_path
+
+
+def _entry_timestamp(entry_json: str) -> float:
+    """0.0 (kept for ever) if the entry holds no readable time."""
+    try:
+        return datetime.fromisoformat(json.loads(entry_json)["time"]).timestamp()
+    except (ValueError, TypeError, KeyError):
+        return 0.0
+
+
+def _add_v2_schema(conn: sqlite3.Connection) -> None:
+    for table, column, definition in _V2_COLUMNS:
+        if column not in _columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    for statement in _V2_INDEXES:
+        conn.execute(statement)
+    _check_rate_columns(conn)
+
+
+def _check_rate_columns(conn: sqlite3.Connection) -> None:
+    for _, name, _, not_null, default, _ in conn.execute("PRAGMA table_info(reservations)"):
+        if name in _RATE_COLUMNS and (not_null or default is not None):
+            raise ValueError(
+                f"Column reservations.{name} must be nullable with no default."
+                " This database was migrated by an unreleased build; restore its .v1.bak copy."
+            )
+
+
+def _is_current(conn: sqlite3.Connection) -> bool:
+    """Nothing to change. Reads only, so a start under load needs no write lock."""
+    if get_schema_version(conn) != CURRENT_SCHEMA_VERSION:
+        return False
+    names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    wanted = {statement.split()[5] for statement in _V2_INDEXES}
+    if not wanted <= names or any(c not in _columns(conn, t) for t, c, _ in _V2_COLUMNS):
+        return False
+    _check_rate_columns(conn)
+    return True
 
 
 def migrate_database(conn: sqlite3.Connection) -> int:
     """Migrate the database to schema v2 in a single atomic transaction.
 
-    Before altering, if old version is seen, takes <db>.v1.bak via a temporary
-    file with mode 0600 without overwriting an existing backup.
-    Refuses databases with user_version > CURRENT_SCHEMA_VERSION.
+    Before altering an existing ledger, copies it to <db>.v1.bak (mode 0600),
+    or to a new name if that exists. Refuses user_version > CURRENT_SCHEMA_VERSION.
+    Existing rows get no client: client names are never read out of old keys.
     """
+    if _is_current(conn):
+        return CURRENT_SCHEMA_VERSION
     conn.execute("BEGIN IMMEDIATE")
     try:
         version = get_schema_version(conn)
@@ -108,81 +282,23 @@ def migrate_database(conn: sqlite3.Connection) -> int:
             )
 
         if version == CURRENT_SCHEMA_VERSION:
-            # Ensure indexes exist
-            for idx_stmt in _V2_INDEXES:
-                conn.execute(idx_stmt)
+            _add_v2_schema(conn)  # no change unless something is missing
             conn.execute("COMMIT")
             return version
 
-        # Version < 2: backup existing database if it's an existing file on disk
         db_file = _get_db_file_path(conn)
-        if db_file and db_file.exists() and db_file.stat().st_size > 0:
-            bak_path = db_file.with_name(f"{db_file.name}.v1.bak")
-            if not bak_path.exists():
-                tmp_bak = db_file.with_name(f"{db_file.name}.v1.bak.tmp.{os.getpid()}_{time.time_ns()}")
-                src2_conn = sqlite3.connect(db_file, timeout=10.0)
-                bak_conn = sqlite3.connect(tmp_bak, timeout=10.0)
-                try:
-                    src2_conn.backup(bak_conn)
-                finally:
-                    bak_conn.close()
-                    src2_conn.close()
-                os.chmod(tmp_bak, 0o600)
-                if not bak_path.exists():
-                    tmp_bak.replace(bak_path)
-                else:
-                    if tmp_bak.exists():
-                        tmp_bak.unlink()
+        if db_file and any(_table_exists(conn, t) for t in ("usage", "reservations", "entries")):
+            _backup_before_upgrade(db_file)
 
-        # Version 0 -> Baseline tables
-        if version == 0:
-            for statement in _V1_SCHEMA:
-                conn.execute(statement)
+        for statement in _V1_SCHEMA:
+            conn.execute(statement)
+        _add_v2_schema(conn)
 
-        # Version 1 -> 2: Add columns, migrations table, backfills
-        if not _column_exists(conn, "usage", "created_at"):
-            conn.execute("ALTER TABLE usage ADD COLUMN created_at REAL NOT NULL DEFAULT 0.0")
-        if not _column_exists(conn, "usage", "client_id"):
-            conn.execute("ALTER TABLE usage ADD COLUMN client_id TEXT DEFAULT NULL")
-
-        if not _column_exists(conn, "entries", "created_at"):
-            conn.execute("ALTER TABLE entries ADD COLUMN created_at REAL NOT NULL DEFAULT 0.0")
-        if not _column_exists(conn, "entries", "client_id"):
-            conn.execute("ALTER TABLE entries ADD COLUMN client_id TEXT DEFAULT NULL")
-
-        if not _column_exists(conn, "reservations", "client_id"):
-            conn.execute("ALTER TABLE reservations ADD COLUMN client_id TEXT DEFAULT NULL")
-        if not _column_exists(conn, "reservations", "input_cost_per_1m_usd"):
-            conn.execute("ALTER TABLE reservations ADD COLUMN input_cost_per_1m_usd REAL NOT NULL DEFAULT 0.0")
-        if not _column_exists(conn, "reservations", "output_cost_per_1m_usd"):
-            conn.execute("ALTER TABLE reservations ADD COLUMN output_cost_per_1m_usd REAL NOT NULL DEFAULT 0.0")
-        if not _column_exists(conn, "reservations", "usd_to_gbp"):
-            conn.execute("ALTER TABLE reservations ADD COLUMN usd_to_gbp REAL NOT NULL DEFAULT 0.0")
-
-        # Backfill entries timestamps and client_id
-        cursor = conn.execute("SELECT id, entry FROM entries WHERE created_at = 0.0 OR client_id IS NULL")
-        updates = []
-        for row_id, entry_str in cursor.fetchall():
-            ts = 0.0
-            client = None
-            try:
-                data = json.loads(entry_str)
-                time_val = data.get("time")
-                if time_val:
-                    ts = datetime.fromisoformat(time_val).timestamp()
-                session_val = data.get("session_id", "")
-                if ":" in session_val:
-                    client = session_val.split(":", 1)[0]
-            except Exception:
-                pass
-            updates.append((ts, client, row_id))
-        if updates:
-            conn.executemany("UPDATE entries SET created_at = ?, client_id = ? WHERE id = ?", updates)
-
-        # Legacy rows in usage get NULL client_id (no prefix parsing)
-        # Apply indexes
-        for idx_stmt in _V2_INDEXES:
-            conn.execute(idx_stmt)
+        rows = conn.execute("SELECT id, entry FROM entries WHERE created_at = 0.0").fetchall()
+        conn.executemany(
+            "UPDATE entries SET created_at = ? WHERE id = ?",
+            [(_entry_timestamp(entry), row_id) for row_id, entry in rows],
+        )
 
         conn.execute(
             """CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -205,7 +321,7 @@ def migrate_database(conn: sqlite3.Connection) -> int:
         conn.execute("PRAGMA user_version = 2")
         conn.execute("COMMIT")
         return 2
-    except Exception:
+    except BaseException:
         conn.execute("ROLLBACK")
         raise
 
@@ -215,59 +331,52 @@ def apply_retention(
 ) -> RetentionStats:
     """Prune entries and usage older than retention_days.
 
-    Pruned rows are replaced by summary rows inside usage grouped by
-    (session_id, client_id, cleared) holding the exact sum with created_at = 0.
-    Rows with created_at = 0 (legacy v1 and summaries) and live reservations
-    are NEVER deleted.
+    Pruned usage is added to one summary row per (session_id, client_id, cleared)
+    holding the exact sum, with created_at = 0; older summaries are merged into it.
+    Other rows with created_at = 0 (legacy v1) are never deleted, and neither is
+    any reservation: an expired one can still be committed by a late call.
     """
     if retention_days <= 0:
-        return RetentionStats(0, 0, 0.0, 0)
+        return RetentionStats(0, 0, 0.0)
 
     cutoff = time.time() - (retention_days * 86400)
-    now = time.time()
+    old = "(summary = 0 AND created_at > 0 AND created_at < ?)"
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # 1. Clean expired reservations
-        res_cursor = conn.execute("DELETE FROM reservations WHERE expires_at < ?", (now,))
-        reservations_pruned = res_cursor.rowcount
-
-        # 2. Prune old audit log entries (legacy created_at = 0 kept)
-        ent_cursor = conn.execute(
+        entries_pruned = conn.execute(
             "DELETE FROM entries WHERE created_at > 0 AND created_at < ?", (cutoff,)
-        )
-        entries_pruned = ent_cursor.rowcount
+        ).rowcount
 
-        # 3. Find usage rows older than cutoff grouped by (session_id, client_id, cleared)
         groups = conn.execute(
-            "SELECT session_id, client_id, cleared, "
-            "COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(candidates_tokens), 0), "
-            "COALESCE(SUM(thoughts_tokens), 0), TOTAL(cost_gbp), COUNT(*) "
-            "FROM usage WHERE created_at > 0 AND created_at < ? "
-            "GROUP BY session_id, client_id, cleared",
+            "SELECT session_id, client_id, cleared, SUM(prompt_tokens), SUM(candidates_tokens),"
+            " SUM(thoughts_tokens), TOTAL(cost_gbp), SUM(summary = 0),"
+            " TOTAL(CASE WHEN summary = 0 THEN cost_gbp END)"
+            f" FROM usage WHERE summary = 1 OR {old}"
+            " GROUP BY session_id, client_id, cleared"
+            " HAVING SUM(summary = 0) > 0 OR COUNT(*) > 1",
             (cutoff,),
         ).fetchall()
 
         usage_pruned = 0
         cost_archived_gbp = 0.0
-
-        if groups:
-            # Delete the pruned usage rows
-            del_cursor = conn.execute("DELETE FROM usage WHERE created_at > 0 AND created_at < ?", (cutoff,))
-            usage_pruned = del_cursor.rowcount
-
-            # Insert summary rows holding exact sums with created_at = 0
-            for session_id, client_id, cleared, p, c, t, spent, count in groups:
-                cost_archived_gbp += spent
-                conn.execute(
-                    "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens, "
-                    "thoughts_tokens, cost_gbp, cleared, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0.0)",
-                    (session_id, client_id, int(p), int(c), int(t), spent, cleared),
-                )
+        for session_id, client_id, cleared, p, c, t, total, count, archived in groups:
+            conn.execute(
+                "DELETE FROM usage WHERE session_id = ? AND client_id IS ? AND cleared = ?"
+                f" AND (summary = 1 OR {old})",
+                (session_id, client_id, cleared, cutoff),
+            )
+            conn.execute(
+                "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens, "
+                "thoughts_tokens, cost_gbp, cleared, created_at, summary) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 1)",
+                (session_id, client_id, p, c, t, total, cleared),
+            )
+            usage_pruned += count
+            cost_archived_gbp += archived
 
         conn.execute("COMMIT")
-    except Exception:
+    except BaseException:
         conn.execute("ROLLBACK")
         raise
 
@@ -275,38 +384,103 @@ def apply_retention(
         entries_pruned=entries_pruned,
         usage_pruned=usage_pruned,
         cost_archived_gbp=cost_archived_gbp,
-        reservations_pruned=reservations_pruned,
     )
 
 
 def backup_database(src_db_path: Path | str, dest_backup_path: Path | str) -> Path:
     """Perform an online hot backup using SQLite's backup API.
 
-    Refuses dest == src. Writes to a temporary file with mode 0600 before atomic rename.
+    Refuses dest == src and a dest that is a ledger in use. The copy is mode 0600
+    from its creation and replaces dest only when complete.
     """
     src = Path(src_db_path).resolve()
     dest = Path(dest_backup_path).resolve()
-    if src == dest:
+    if src == dest or (src.exists() and dest.exists() and src.samefile(dest)):
         raise ValueError(f"Destination backup path cannot be the same as source: {src}")
+    if dest in [src.with_name(src.name + s) for s in (*_SIDECARS, ".lock")]:
+        raise ValueError(f"Destination backup path belongs to the source database: {dest}")
     if not src.exists():
         raise FileNotFoundError(f"Source database does not exist: {src}")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest.with_name(f"{dest.name}.tmp.{os.getpid()}_{time.time_ns()}")
-    src_conn = sqlite3.connect(src, timeout=10.0)
+    dest_fd = None
+    if lock_path(dest).exists():
+        dest_fd = acquire_ledger_lock(dest, exclusive=True)
     try:
-        dest_conn = sqlite3.connect(tmp_dest, timeout=10.0)
-        try:
-            src_conn.backup(dest_conn)
-        finally:
-            dest_conn.close()
+        with ledger_lock(src, timeout=10.0):
+            source = sqlite3.connect(src, timeout=10.0)
+            try:
+                _snapshot(source, dest, overwrite=True)
+            finally:
+                source.close()
     finally:
-        src_conn.close()
-
-    os.chmod(tmp_dest, 0o600)
-    tmp_dest.replace(dest)
-    os.chmod(dest, 0o600)
+        if dest_fd is not None:
+            os.close(dest_fd)
     return dest
+
+
+def _verify_backup(backup: Path) -> None:
+    conn = sqlite3.connect(backup, timeout=10.0)
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise ValueError(f"Backup file failed integrity check: {row}")
+
+        version = get_schema_version(conn)
+        if version not in (0, 1, 2):
+            raise ValueError(f"Unsupported backup schema version: {version}")
+
+        for table, base in _BASE_COLUMNS.items():
+            if not _table_exists(conn, table):
+                raise ValueError(f"Backup file missing required table: {table}")
+            required = set(base)
+            if version == 2:
+                # summary is added on the next start if it is absent.
+                required |= {c for t, c, _ in _V2_COLUMNS if t == table and c != "summary"}
+            missing = required - _columns(conn, table)
+            if missing:
+                raise ValueError(
+                    f"Backup table {table} is missing columns: {', '.join(sorted(missing))}"
+                )
+    finally:
+        conn.close()
+
+
+def _open_exclusive(target: Path) -> sqlite3.Connection:
+    """Open target so that no other SQLite connection can read or write it.
+
+    Leaves it in rollback-journal mode, which folds in and removes any WAL.
+    """
+    conn = sqlite3.connect(target, timeout=0.5, isolation_level=None)
+    try:
+        conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+        (mode,) = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if mode != "delete":
+            raise sqlite3.OperationalError("database is locked")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _replace_unreadable(backup: Path, target: Path, pre_bak: Path) -> None:
+    """The target is not a readable database: keep its bytes and replace the file."""
+    for suffix in ("", "-wal"):
+        original = target.with_name(target.name + suffix)
+        if original.exists():
+            copy = _private_temp(pre_bak)
+            try:
+                shutil.copyfile(original, copy)
+                os.link(copy, pre_bak.with_name(pre_bak.name + suffix))
+            finally:
+                copy.unlink(missing_ok=True)
+    source = sqlite3.connect(backup, timeout=10.0)
+    try:
+        _snapshot(source, target, overwrite=True)
+    finally:
+        source.close()
 
 
 def restore_database(
@@ -315,95 +489,77 @@ def restore_database(
     """Restore target database from a verified backup.
 
     Checks:
-    - Backup exists and passes PRAGMA integrity_check.
-    - Required tables exist: usage, reservations, session_caps, entries.
-    - user_version in (0, 1, 2).
+    - Backup exists, passes PRAGMA integrity_check and has the required tables and
+      columns, with user_version in (0, 1, 2).
     - If target exists, requires force=True.
-    - Tests exclusive lock on target to ensure no running server.
-    - Creates <db>.pre-restore.bak via temporary file (mode 0600, never overwriting existing).
+    - No process holds the ledger's lock file and no SQLite connection holds the
+      database; both stay locked until the restore ends.
+    - Creates <db>.pre-restore.bak (mode 0600, never overwriting an existing one).
+
+    An existing database is overwritten through SQLite's backup API, in one
+    transaction: it ends up as the old ledger or the backup, never a mixture.
     """
     backup = Path(src_backup_path).resolve()
     target = Path(target_db_path).resolve()
     if not backup.exists():
         raise FileNotFoundError(f"Backup file does not exist: {backup}")
+    if backup == target or (target.exists() and backup.samefile(target)):
+        raise ValueError(f"Backup and target are the same file: {target}")
+    _verify_backup(backup)
 
-    # 1. Verify backup integrity
-    conn = sqlite3.connect(backup, timeout=10.0)
-    try:
-        cursor = conn.execute("PRAGMA integrity_check")
-        row = cursor.fetchone()
-        if not row or row[0] != "ok":
-            raise ValueError(f"Backup file failed integrity check: {row}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with ledger_lock(target, exclusive=True):
+        if not target.exists():
+            source = sqlite3.connect(backup, timeout=10.0)
+            try:
+                _snapshot(source, target, overwrite=False)
+            finally:
+                source.close()
+            return
 
-        # Check required tables
-        for tbl in ("usage", "reservations", "session_caps", "entries"):
-            if not _table_exists(conn, tbl):
-                raise ValueError(f"Backup file missing required table: {tbl}")
-
-        # Check user_version in (0, 1, 2)
-        version = get_schema_version(conn)
-        if version not in (0, 1, 2):
-            raise ValueError(f"Unsupported backup schema version: {version}")
-    finally:
-        conn.close()
-
-    # 2. Check target database
-    if target.exists():
         if not force:
             raise FileExistsError(f"Target database already exists: {target}. Use --force to overwrite.")
-
-        # Test exclusive lock to detect running server
-        try:
-            target_conn = sqlite3.connect(target, timeout=0.5)
-            try:
-                target_conn.execute("BEGIN EXCLUSIVE")
-                target_conn.rollback()
-            finally:
-                target_conn.close()
-        except sqlite3.OperationalError as exc:
-            raise RuntimeError(f"Target database is currently locked by a running process: {exc}")
-        except sqlite3.DatabaseError:
-            pass
-
-        # Pre-restore backup
         pre_bak = target.with_name(f"{target.name}.pre-restore.bak")
         if pre_bak.exists():
             raise FileExistsError(f"Pre-restore backup already exists and will not be overwritten: {pre_bak}")
-        tmp_pre_bak = target.with_name(f"{target.name}.pre-restore.bak.tmp.{os.getpid()}_{time.time_ns()}")
+
         try:
-            src_conn = sqlite3.connect(target, timeout=10.0)
-            try:
-                dest_conn = sqlite3.connect(tmp_pre_bak, timeout=10.0)
-                try:
-                    src_conn.backup(dest_conn)
-                finally:
-                    dest_conn.close()
-            finally:
-                src_conn.close()
+            target_conn = _open_exclusive(target)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            raise LedgerInUse(f"Target database is currently locked by a running process: {exc}") from exc
         except sqlite3.DatabaseError:
-            import shutil
-            shutil.copy2(target, tmp_pre_bak)
+            _replace_unreadable(backup, target, pre_bak)
+            return
 
-        os.chmod(tmp_pre_bak, 0o600)
-        tmp_pre_bak.replace(pre_bak)
-        os.chmod(pre_bak, 0o600)
-
-    # 3. Restore via atomic temp file
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_target = target.with_name(f"{target.name}.tmp.{os.getpid()}_{time.time_ns()}")
-    backup_conn = sqlite3.connect(backup, timeout=10.0)
-    try:
-        dest_conn = sqlite3.connect(tmp_target, timeout=10.0)
         try:
-            backup_conn.backup(dest_conn)
+            _snapshot(target_conn, pre_bak, overwrite=False)
+            source = sqlite3.connect(backup, timeout=10.0)
+            try:
+                _copy_database(source, target_conn)
+            finally:
+                source.close()
+            os.chmod(target, 0o600)
+            target_conn.execute("PRAGMA journal_mode=WAL")
         finally:
-            dest_conn.close()
-    finally:
-        backup_conn.close()
+            target_conn.close()
 
-    os.chmod(tmp_target, 0o600)
-    tmp_target.replace(target)
-    os.chmod(target, 0o600)
+
+def _open_ledger(db_path: Path) -> sqlite3.Connection:
+    """Open an existing ledger. A mistyped path must not create one."""
+    if not db_path.is_file():
+        raise FileNotFoundError(f"Database does not exist: {db_path}")
+    conn = sqlite3.connect(
+        f"{db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=10.0, isolation_level=None
+    )
+    try:
+        if not all(_table_exists(conn, table) for table in _BASE_COLUMNS):
+            raise ValueError(f"Not an AgentGuard ledger: {db_path}")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def main() -> None:
@@ -433,35 +589,33 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        from core.config import get_settings
-        settings = get_settings()
-    except Exception:
-        settings = None
+        if args.command in ("migrate", "prune"):
+            from core.config import get_settings
 
-    try:
-        if args.command == "migrate":
-            db_path = Path(args.db) if args.db else (settings.sqlite_db_path if settings else Path("data/guard_state.db"))
-            conn = sqlite3.connect(db_path, timeout=10.0)
-            try:
-                version = migrate_database(conn)
-                print(f"Database migrated to version {version}: {db_path}")
-            finally:
-                conn.close()
-
-        elif args.command == "prune":
-            db_path = Path(args.db) if args.db else (settings.sqlite_db_path if settings else Path("data/guard_state.db"))
-            retention_days = args.days if args.days is not None else (settings.ledger_retention_days if settings else 0)
-            conn = sqlite3.connect(db_path, timeout=10.0)
-            try:
-                # Migrate first
-                migrate_database(conn)
-                stats = apply_retention(conn, retention_days)
-                print(
-                    f"Pruned {stats.entries_pruned} entries, {stats.usage_pruned} usage rows "
-                    f"({stats.cost_archived_gbp:.6f} GBP archived), {stats.reservations_pruned} expired reservations"
-                )
-            finally:
-                conn.close()
+            settings = None
+            if args.db is None or (args.command == "prune" and args.days is None):
+                settings = get_settings()
+            db_path = Path(args.db) if args.db else settings.sqlite_db_path
+            if not db_path.is_file():
+                raise FileNotFoundError(f"Database does not exist: {db_path}")
+            with ledger_lock(db_path, timeout=10.0):
+                conn = _open_ledger(db_path)
+                try:
+                    version = migrate_database(conn)
+                    if args.command == "migrate":
+                        print(f"Database migrated to version {version}: {db_path}")
+                    else:
+                        days = args.days if args.days is not None else settings.ledger_retention_days
+                        stats = apply_retention(conn, days)
+                        if days <= 0:
+                            print("Retention is off (0 days): nothing was pruned")
+                        else:
+                            print(
+                                f"Pruned {stats.entries_pruned} entries, {stats.usage_pruned} usage rows "
+                                f"({stats.cost_archived_gbp:.6f} GBP archived)"
+                            )
+                finally:
+                    conn.close()
 
         elif args.command == "backup":
             dest = backup_database(args.src, args.dest)

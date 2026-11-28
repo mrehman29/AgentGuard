@@ -74,14 +74,8 @@ _mcp_app = mcp.streamable_http_app()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()  # a bad setting stops the server here, with its name
-    # Run schema migration off-loop during startup
-    try:
-        tracker = budget_store.get_tracker()
-        if hasattr(tracker, "_create_schema") and hasattr(tracker, "_executor"):
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(tracker._executor, tracker._create_schema)
-    except Exception:
-        pass
+    # Opens and migrates the ledger off the loop. A failure stops the server.
+    await asyncio.get_running_loop().run_in_executor(None, budget_store.get_tracker)
     try:
         async with mcp.session_manager.run():
             yield
@@ -249,7 +243,6 @@ async def reset_budget(session_id: str, request: Request) -> BudgetStatus:
             pass
         raise HTTPException(status_code=422, detail="Invalid session_id.")
     tracker = budget_store.get_tracker()
-    status = await tracker.areset(session_id)
     reset_entry = LedgerEntry(
         time=datetime.now(UTC),
         source="web",
@@ -258,6 +251,12 @@ async def reset_budget(session_id: str, request: Request) -> BudgetStatus:
         outcome="OK",
         cost_gbp=0.0,
     )
+    try:
+        status = await tracker.areset(session_id)
+    except asyncio.CancelledError as cancelled:
+        if cancelled.__cause__ is None:  # the reset happened
+            await tracker.arecord(reset_entry)
+        raise
     await tracker.arecord(reset_entry)
     return status
 

@@ -12,6 +12,8 @@ from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+import anyio
+
 from core import budget_store, guard_core
 from core.config import Settings, get_settings, token_cost_gbp
 from core.pipeline import execute_guarded
@@ -90,6 +92,38 @@ async def default_model_caller(
 model_caller: Callable[
     [str, Settings], Any
 ] = default_model_caller
+
+
+async def _record_turn(
+    tracker: budget_store.SessionBudgetTracker, session_id: str, outcome: str, cost_gbp: float
+) -> None:
+    """Record an agent turn that is ending in failure. A ledger error is logged."""
+    try:
+        await tracker.arecord(
+            LedgerEntry(
+                time=datetime.now(UTC),
+                source="web",
+                session_id=session_id,
+                label="agent turn",
+                outcome=outcome,
+                cost_gbp=cost_gbp,
+            )
+        )
+    except Exception:
+        logger.exception("ledger update failed")
+
+
+async def _abandon_turn(
+    tracker: budget_store.SessionBudgetTracker, session_id: str, reservation_id: str
+) -> None:
+    """Release an uncharged turn and record it, even if cancelled again meanwhile."""
+    with anyio.CancelScope(shield=True):
+        try:
+            await tracker.arelease(reservation_id)
+        except Exception:
+            logger.exception("could not release a reservation; it will expire")
+        finally:
+            await _record_turn(tracker, session_id, "ERROR", 0.0)
 
 
 async def _run_loop_workflow(
@@ -282,17 +316,21 @@ async def _run_standard_workflow(
         return
 
     # Agent model turn
-    budget_before = await tracker.acheck_budget(active_session)
-    rates = settings.rates_for(settings.agent)
-    estimated_input_tokens = max(
-        len(prompt.encode("utf-8", "replace")) // 4 + 100,
-        settings.budget_reserve_input_tokens,
-    )
-    reserve_cost = token_cost_gbp(rates, estimated_input_tokens, settings.agent.max_output_tokens)
-    ttl_sec = budget_store.RESERVATION_TTL_TIMEOUTS * settings.agent.timeout_sec
-    reservation_id = await tracker.areserve(
-        active_session, reserve_cost, rates=rates, ttl_sec=ttl_sec
-    )
+    try:
+        budget_before = await tracker.acheck_budget(active_session)
+        rates = settings.rates_for(settings.agent)
+        estimated_input_tokens = max(
+            len(prompt.encode("utf-8", "replace")) // 4 + 100,
+            settings.budget_reserve_input_tokens,
+        )
+        reserve_cost = token_cost_gbp(rates, estimated_input_tokens, settings.agent.max_output_tokens)
+        ttl_sec = budget_store.RESERVATION_TTL_TIMEOUTS * settings.agent.timeout_sec
+        reservation_id = await tracker.areserve(
+            active_session, reserve_cost, rates=rates, ttl_sec=ttl_sec
+        )
+    except BaseException:  # a ledger error or a cancellation: nothing was reserved
+        await _record_turn(tracker, active_session, "ERROR", 0.0)
+        raise
 
     if reservation_id is None:
         # Refused reservation -> check if already exceeded (gates=[]) or would exceed (gates=[REGEX])
@@ -304,19 +342,7 @@ async def _run_standard_workflow(
             else "Circuit breaker open: agent turn reservation would exceed cap."
         )
 
-        try:
-            await tracker.arecord(
-                LedgerEntry(
-                    time=datetime.now(UTC),
-                    source="web",
-                    session_id=active_session,
-                    label="agent turn",
-                    outcome="BLOCK budget",
-                    cost_gbp=0.0,
-                )
-            )
-        except Exception:
-            pass
+        await _record_turn(tracker, active_session, "BLOCK budget", 0.0)
 
         refused_guard = GuardEvaluation(
             decision=Decision.BLOCK,
@@ -357,7 +383,7 @@ async def _run_standard_workflow(
     committed = False
     try:
         usage, text_reply, tool_call = await model_caller(prompt, settings)
-        commit_res = await tracker.acommit(reservation_id, usage, rates=rates)
+        commit_res = await tracker.acommit(reservation_id, usage)
         committed = True
         # Charged either way: unusable output still costs.
         unusable = not tool_call and not (text_reply or "").strip()
@@ -372,53 +398,29 @@ async def _run_standard_workflow(
             )
         )
     except CommitCancelled as exc:
-        committed = True
-        try:
-            await tracker.arecord(
-                LedgerEntry(
-                    time=datetime.now(UTC),
-                    source="web",
-                    session_id=active_session,
-                    label="agent turn",
-                    outcome="ERROR",
-                    cost_gbp=exc.result.cost_gbp,
-                )
-            )
-        except Exception:
-            pass
+        await _record_turn(tracker, active_session, "ERROR", exc.result.cost_gbp)
         raise
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        if not committed:
+            await _abandon_turn(tracker, active_session, reservation_id)
+        # The queue is unbounded, so this never waits.
+        queue.put_nowait(
+            RunEvent(type="run_error", run_id=run_id, message="Agent model call cancelled.")
+        )
+        raise
+    except Exception as exc:
         # Safe to log: a ModelError holds no message, and only types otherwise.
         if isinstance(exc, ModelError):
             logger.warning("agent model call failed: %s", exc)
         elif isinstance(exc, TimeoutError):
             logger.warning("agent model call timed out")
-        elif not isinstance(exc, asyncio.CancelledError):
+        else:
             logger.warning("agent turn failed: %s", type(exc).__name__)
         if not committed:
-            try:
-                await tracker.arelease(reservation_id)
-            except Exception:
-                pass
-            try:
-                await tracker.arecord(
-                    LedgerEntry(
-                        time=datetime.now(UTC),
-                        source="web",
-                        session_id=active_session,
-                        label="agent turn",
-                        outcome="ERROR",
-                        cost_gbp=0.0,
-                    )
-                )
-            except Exception:
-                pass
-        err_msg = (
-            "Agent model call cancelled."
-            if isinstance(exc, asyncio.CancelledError)
-            else "Agent model call failed. Nothing ran."
+            await _abandon_turn(tracker, active_session, reservation_id)
+        await queue.put(
+            RunEvent(type="run_error", run_id=run_id, message="Agent model call failed. Nothing ran.")
         )
-        await queue.put(RunEvent(type="run_error", run_id=run_id, message=err_msg))
         return
 
     # Check for lone surrogates in model outputs (N-1)
@@ -576,7 +578,7 @@ async def run_agent_workflow(
     finally:
         if not task.done():
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            # Wait for its ledger cleanup. Unshielded, a disconnect's cancel scope
+            # would keep cancelling it, and the generator would not wait.
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait([task])

@@ -67,10 +67,6 @@ def _safe_session_id(val: Any) -> str:
     return "invalid"
 
 
-async def _arecord(tracker: Any, entry: LedgerEntry) -> None:
-    await tracker.arecord(entry)
-
-
 def _validate_arg_str(val: str, name: str, max_len: int = 20_000) -> str:
     if not isinstance(val, str):
         raise TypeError(f"{name} must be text")
@@ -103,8 +99,7 @@ async def guard_check_action(
             raise ValueError("args_json must be a JSON object")
     except Exception as exc:
         try:
-            await _arecord(
-                tracker,
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -131,8 +126,7 @@ async def guard_check_action(
     except Exception as exc:
         logger.exception("MCP guard_check_action failed")
         try:
-            await _arecord(
-                tracker,
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -165,8 +159,7 @@ async def guard_execute_sandbox(
             provider = _validate_arg_str(provider, "provider", max_len=32)
     except Exception as exc:
         try:
-            await _arecord(
-                tracker,
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -207,8 +200,7 @@ async def guard_get_budget_status(session_id: str = "default") -> dict[str, Any]
 
     if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
         try:
-            await _arecord(
-                tracker,
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
