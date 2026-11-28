@@ -412,9 +412,9 @@ async def test_a_cancelled_prune_stops_waiting_for_the_lock(tmp_path, monkeypatc
         await asyncio.sleep(0.2)
         assert not task.done()
         task.cancel()
-        async with asyncio.timeout(3):  # well inside the lock wait
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        done, _ = await asyncio.wait([task], timeout=3)  # well inside the lock wait
+        assert done, "the cancelled prune went on waiting"
+        assert task.cancelled()
     assert old_rows(path) == 22
 
 
