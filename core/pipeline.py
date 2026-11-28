@@ -19,6 +19,7 @@ from core.schemas import (
     EXECUTABLE_TOOL,
     MAX_OUTPUT_CHARS,
     BudgetStatus,
+    CommitCancelled,
     Decision,
     GuardEvaluation,
     LedgerEntry,
@@ -94,6 +95,19 @@ def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation)
     )
 
 
+async def _arecord(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
+    await budget_store.get_tracker().arecord(
+        LedgerEntry(
+            time=datetime.now(UTC),
+            source=source,
+            session_id=session_id,
+            label=label,
+            outcome=ledger_outcome(guard),
+            cost_gbp=guard.cost_gbp,
+        )
+    )
+
+
 async def execute_guarded(
     intent: str,
     tool_name: str,
@@ -138,10 +152,19 @@ async def execute_guarded(
                 on_event=on_event,
                 record=False,
             )
+        except CommitCancelled as exc:
+            cancelled = error_block(
+                "Guard error: cancelled.", latency_ms=_elapsed_ms(start), cost_gbp=exc.result.cost_gbp
+            )
+            try:
+                await _arecord(session_id, source, label, cancelled)
+            except Exception:
+                logger.exception("ledger update failed")
+            raise
         except asyncio.CancelledError:
             cancelled = error_block("Guard error: cancelled.", latency_ms=_elapsed_ms(start))
             try:
-                _record(session_id, source, label, cancelled)
+                await _arecord(session_id, source, label, cancelled)
             except Exception:
                 logger.exception("ledger update failed")
             raise
@@ -167,11 +190,11 @@ async def execute_guarded(
         )
 
     try:
-        budget_store.get_tracker().check_budget(session_id)
+        await budget_store.get_tracker().acheck_budget(session_id)
     except Exception:
         guard = ledger_error(guard)
     try:
-        _record(session_id, source, label, guard)
+        await _arecord(session_id, source, label, guard)
     except Exception:
         guard = ledger_error(guard)
 
@@ -194,7 +217,7 @@ async def execute_guarded(
             )
 
     try:
-        budget = budget_store.get_tracker().check_budget(session_id)
+        budget = await budget_store.get_tracker().acheck_budget(session_id)
     except Exception:
         logger.exception("budget read failed")
         budget = _unavailable_budget(session_id)

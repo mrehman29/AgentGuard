@@ -110,6 +110,30 @@ class MemoryTracker:
     def recent_entries(self, limit: int = 50) -> list[LedgerEntry]:
         return self.entries[-limit:] if limit > 0 else []
 
+    async def acheck_budget(self, session_id: str) -> BudgetStatus:
+        return self.check_budget(session_id)
+
+    async def areserve(self, session_id: str, estimate_gbp: float, *, rates=None, ttl_sec=None) -> str | None:
+        return self.reserve(session_id, estimate_gbp)
+
+    async def acommit(self, reservation_id: str, usage: TokenUsage, rates=None) -> CommitResult:
+        return self.commit(reservation_id, usage, rates)
+
+    async def arelease(self, reservation_id: str) -> None:
+        self.release(reservation_id)
+
+    async def aset_session_cap(self, session_id: str, cap_gbp: float) -> BudgetStatus:
+        return self.set_session_cap(session_id, cap_gbp)
+
+    async def areset(self, session_id: str) -> BudgetStatus:
+        return self.reset(session_id)
+
+    async def arecord(self, entry: LedgerEntry) -> None:
+        self.record(entry)
+
+    async def arecent_entries(self, limit: int = 50, client_id: str | None = None) -> list[LedgerEntry]:
+        return self.recent_entries(limit=limit)
+
 
 @pytest.fixture(autouse=True)
 def isolate_sqlite_db(tmp_path, monkeypatch):

@@ -1,5 +1,6 @@
 """AgentGuard web application and API (PLAN.md sections 2, 5, 9, C.1, C.2)."""
 
+import asyncio
 import re
 import sys
 from collections.abc import AsyncIterator
@@ -72,7 +73,15 @@ _mcp_app = mcp.streamable_http_app()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    get_settings()  # a bad setting stops the server here, with its name
+    settings = get_settings()  # a bad setting stops the server here, with its name
+    # Run schema migration off-loop during startup
+    try:
+        tracker = budget_store.get_tracker()
+        if hasattr(tracker, "_create_schema") and hasattr(tracker, "_executor"):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(tracker._executor, tracker._create_schema)
+    except Exception:
+        pass
     try:
         async with mcp.session_manager.run():
             yield
@@ -216,7 +225,7 @@ async def get_budget(session_id: str) -> BudgetStatus:
     if not re.fullmatch(SESSION_ID_PATTERN, session_id):
         raise HTTPException(status_code=422, detail="Invalid session_id.")
     tracker = budget_store.get_tracker()
-    return tracker.check_budget(session_id)
+    return await tracker.acheck_budget(session_id)
 
 
 @app.post("/api/budget/{session_id}/reset", response_model=BudgetStatus)
@@ -227,38 +236,36 @@ async def reset_budget(session_id: str, request: Request) -> BudgetStatus:
     if not re.fullmatch(SESSION_ID_PATTERN, session_id):
         try:
             tracker = budget_store.get_tracker()
-            tracker.record(
-                LedgerEntry(
-                    time=datetime.now(UTC),
-                    source="web",
-                    session_id="invalid",
-                    label="reset",
-                    outcome="BLOCK error",
-                    cost_gbp=0.0,
-                )
+            entry = LedgerEntry(
+                time=datetime.now(UTC),
+                source="web",
+                session_id="invalid",
+                label="reset",
+                outcome="BLOCK error",
+                cost_gbp=0.0,
             )
+            await tracker.arecord(entry)
         except Exception:
             pass
         raise HTTPException(status_code=422, detail="Invalid session_id.")
     tracker = budget_store.get_tracker()
-    status = tracker.reset(session_id)
-    tracker.record(
-        LedgerEntry(
-            time=datetime.now(UTC),
-            source="web",
-            session_id=session_id,
-            label="reset",
-            outcome="OK",
-            cost_gbp=0.0,
-        )
+    status = await tracker.areset(session_id)
+    reset_entry = LedgerEntry(
+        time=datetime.now(UTC),
+        source="web",
+        session_id=session_id,
+        label="reset",
+        outcome="OK",
+        cost_gbp=0.0,
     )
+    await tracker.arecord(reset_entry)
     return status
 
 
 @app.get("/api/ledger/recent")
 async def get_recent_ledger(limit: int = Query(default=50, ge=1, le=200)) -> list[LedgerEntry]:
     tracker = budget_store.get_tracker()
-    return tracker.recent_entries(limit=limit)
+    return await tracker.arecent_entries(limit=limit)
 
 
 @app.post("/api/run")

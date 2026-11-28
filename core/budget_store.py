@@ -4,16 +4,32 @@ Spend is reserved before a model call, then committed with the actual usage or
 released. Signatures, including get_tracker(), are frozen.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import logging
 import math
+from pathlib import Path
 import sqlite3
 import time
+from typing import Iterator
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 from core.config import get_settings, token_cost_gbp
-from core.schemas import BudgetStatus, CommitResult, LedgerEntry, ModelRates, TokenUsage
+from core.schemas import (
+    BudgetStatus,
+    CommitCancelled,
+    CommitResult,
+    LedgerEntry,
+    ModelRates,
+    TokenUsage,
+)
+from core.storage import (
+    RetentionStats,
+    apply_retention,
+    backup_database,
+    migrate_database,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,32 +38,25 @@ BUSY_TIMEOUT_MS = 5000
 # of the longer model timeouts. It can still be committed if its call finishes late.
 RESERVATION_TTL_TIMEOUTS = 12
 
-_SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        prompt_tokens INTEGER NOT NULL,
-        candidates_tokens INTEGER NOT NULL,
-        thoughts_tokens INTEGER NOT NULL,
-        cost_gbp REAL NOT NULL,
-        cleared INTEGER NOT NULL DEFAULT 0
-    )""",
-    "CREATE INDEX IF NOT EXISTS usage_session ON usage (session_id, cleared)",
-    """CREATE TABLE IF NOT EXISTS reservations (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        amount_gbp REAL NOT NULL,
-        expires_at REAL NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS session_caps (
-        session_id TEXT PRIMARY KEY,
-        cap_gbp REAL NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS entries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entry TEXT NOT NULL
-    )""",
-)
+
+def session_key(client_id: str | None, session_id: str) -> str:
+    """Compose a session key. Bare key when client_id is None."""
+    if client_id is None:
+        return session_id
+    return f"{client_id}:{session_id}"
+
+
+def split_session_key(key: str) -> tuple[str | None, str]:
+    """Split session key into (client_id, session_id). Returns (None, key) for bare keys."""
+    if ":" in key:
+        client, sess = key.split(":", 1)
+        return client, sess
+    return None, key
+
+
+def to_nano(val: float) -> int:
+    """Convert GBP float to integer nano-pounds to eliminate float summation drift."""
+    return round(val * 1_000_000_000)
 
 
 def _check_amount(value: float) -> None:
@@ -59,6 +68,7 @@ class SessionBudgetTracker:
     def __init__(self) -> None:
         self._path = get_settings().sqlite_db_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agentguard-db")
         self._create_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -76,8 +86,7 @@ class SessionBudgetTracker:
             connection = self._connect()
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
-                for statement in _SCHEMA:
-                    connection.execute(statement)
+                migrate_database(connection)
                 return
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc) or time.monotonic() >= deadline:
@@ -97,27 +106,69 @@ class SessionBudgetTracker:
         finally:
             connection.close()  # rolls back anything not committed
 
-    def _status(self, db: sqlite3.Connection, session_id: str) -> BudgetStatus:
+    def _status(self, db: sqlite3.Connection, session_key_str: str) -> BudgetStatus:
         settings = get_settings()
+        client_id, _ = split_session_key(session_key_str)
+
         prompt, candidates, thoughts, spent = db.execute(
             "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(candidates_tokens), 0),"
             " COALESCE(SUM(thoughts_tokens), 0), TOTAL(cost_gbp)"
             " FROM usage WHERE session_id = ? AND cleared = 0",
-            (session_id,),
+            (session_key_str,),
         ).fetchone()
+
         (reserved,) = db.execute(
             "SELECT TOTAL(amount_gbp) FROM reservations WHERE session_id = ? AND expires_at > ?",
-            (session_id, time.time()),
+            (session_key_str, time.time()),
         ).fetchone()
+
         (global_spent,) = db.execute("SELECT TOTAL(cost_gbp) FROM usage").fetchone()
+
         row = db.execute(
-            "SELECT cap_gbp FROM session_caps WHERE session_id = ?", (session_id,)
+            "SELECT cap_gbp FROM session_caps WHERE session_id = ?", (session_key_str,)
         ).fetchone()
         cap = settings.session_budget_cap_gbp
         if row is not None:
             cap = min(cap, row[0])
+
+        # Client-level accounting if client_id is present
+        client_spent_gbp: float | None = None
+        client_reserved_gbp: float | None = None
+        client_cap_gbp: float | None = None
+
+        if client_id is not None:
+            (c_spent,) = db.execute(
+                "SELECT TOTAL(cost_gbp) FROM usage WHERE client_id = ? AND cleared = 0",
+                (client_id,),
+            ).fetchone()
+            (c_res,) = db.execute(
+                "SELECT TOTAL(amount_gbp) FROM reservations WHERE client_id = ? AND expires_at > ?",
+                (client_id, time.time()),
+            ).fetchone()
+            client_spent_gbp = c_spent
+            client_reserved_gbp = c_res
+            client_cap_gbp = settings.client_budget_cap_gbp
+
+        # Integer comparisons for caps to prevent float rounding errors
+        session_remaining = max(0.0, cap - spent - reserved)
+        if client_id is not None and client_cap_gbp is not None and client_spent_gbp is not None and client_reserved_gbp is not None:
+            client_remaining = max(0.0, client_cap_gbp - client_spent_gbp - client_reserved_gbp)
+            remaining_gbp = min(session_remaining, client_remaining)
+        else:
+            remaining_gbp = session_remaining
+
+        session_exceeded = to_nano(spent) >= to_nano(cap)
+        global_exceeded = to_nano(global_spent) >= to_nano(settings.global_budget_cap_gbp)
+        client_exceeded = (
+            client_id is not None
+            and client_cap_gbp is not None
+            and client_spent_gbp is not None
+            and to_nano(client_spent_gbp) >= to_nano(client_cap_gbp)
+        )
+        is_exceeded = session_exceeded or global_exceeded or client_exceeded
+
         return BudgetStatus(
-            session_id=session_id,
+            session_id=session_key_str,
             prompt_tokens=prompt,
             candidates_tokens=candidates,
             thoughts_tokens=thoughts,
@@ -125,46 +176,99 @@ class SessionBudgetTracker:
             spent_gbp=spent,
             reserved_gbp=reserved,
             cap_gbp=cap,
-            remaining_gbp=max(0.0, cap - spent - reserved),
+            remaining_gbp=remaining_gbp,
             global_spent_gbp=global_spent,
             global_cap_gbp=settings.global_budget_cap_gbp,
-            is_exceeded=spent >= cap or global_spent >= settings.global_budget_cap_gbp,
+            is_exceeded=is_exceeded,
+            client_id=client_id,
+            client_spent_gbp=client_spent_gbp,
+            client_reserved_gbp=client_reserved_gbp,
+            client_cap_gbp=client_cap_gbp,
         )
 
     def check_budget(self, session_id: str) -> BudgetStatus:
         with self._transaction("DEFERRED") as db:
             return self._status(db, session_id)
 
-    def reserve(self, session_id: str, estimate_gbp: float) -> str | None:
+    def reserve(
+        self,
+        session_id: str,
+        estimate_gbp: float,
+        *,
+        rates: ModelRates | None = None,
+        ttl_sec: float | None = None,
+    ) -> str | None:
         """Return a reservation id, or None if a cap would be exceeded."""
         _check_amount(estimate_gbp)
         settings = get_settings()
-        timeout = max(settings.classifier.timeout_sec, settings.agent.timeout_sec)
-        ttl = timeout * RESERVATION_TTL_TIMEOUTS
+        if ttl_sec is None:
+            timeout = max(settings.classifier.timeout_sec, settings.agent.timeout_sec)
+            ttl_sec = timeout * RESERVATION_TTL_TIMEOUTS
+
+        client_id, _ = split_session_key(session_id)
+
         with self._transaction() as db:
             now = time.time()
             status = self._status(db, session_id)
             (global_reserved,) = db.execute(
                 "SELECT TOTAL(amount_gbp) FROM reservations WHERE expires_at > ?", (now,)
             ).fetchone()
+
+            # Integer nano-pound comparison prevents float drift
+            est_nano = to_nano(estimate_gbp)
+            sess_overshoot = (
+                to_nano(status.spent_gbp) + to_nano(status.reserved_gbp) + est_nano
+                > to_nano(status.cap_gbp)
+            )
+            glob_overshoot = (
+                to_nano(status.global_spent_gbp) + to_nano(global_reserved) + est_nano
+                > to_nano(status.global_cap_gbp)
+            )
+            client_overshoot = False
             if (
-                status.is_exceeded
-                or status.spent_gbp + status.reserved_gbp + estimate_gbp > status.cap_gbp
-                or status.global_spent_gbp + global_reserved + estimate_gbp > status.global_cap_gbp
+                client_id is not None
+                and status.client_cap_gbp is not None
+                and status.client_spent_gbp is not None
+                and status.client_reserved_gbp is not None
             ):
+                client_overshoot = (
+                    to_nano(status.client_spent_gbp) + to_nano(status.client_reserved_gbp) + est_nano
+                    > to_nano(status.client_cap_gbp)
+                )
+
+            if status.is_exceeded or sess_overshoot or glob_overshoot or client_overshoot:
                 return None
+
             reservation_id = uuid.uuid4().hex
+            in_cost = rates.input_cost_per_1m_usd if rates else 0.0
+            out_cost = rates.output_cost_per_1m_usd if rates else 0.0
+            u_to_g = rates.usd_to_gbp if rates else 0.0
+
             db.execute(
-                "INSERT INTO reservations (id, session_id, amount_gbp, expires_at)"
-                " VALUES (?, ?, ?, ?)",
-                (reservation_id, session_id, estimate_gbp, now + ttl),
+                "INSERT INTO reservations (id, session_id, amount_gbp, expires_at, client_id, "
+                "input_cost_per_1m_usd, output_cost_per_1m_usd, usd_to_gbp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    reservation_id,
+                    session_id,
+                    estimate_gbp,
+                    now + ttl_sec,
+                    client_id,
+                    in_cost,
+                    out_cost,
+                    u_to_g,
+                ),
             )
             return reservation_id
 
-    def commit(self, reservation_id: str, usage: TokenUsage, rates: ModelRates) -> CommitResult:
+    def commit(
+        self,
+        reservation_id: str,
+        usage: TokenUsage,
+        rates: ModelRates | None = None,
+    ) -> CommitResult:
         """Replace a reservation with the actual cost. Unknown id: KeyError.
 
-        rates are those of the model called.
         A database error is retried once, so a billed call is not lost to it.
         """
         try:
@@ -173,26 +277,54 @@ class SessionBudgetTracker:
             logger.warning("commit failed; retrying once")
             return self._commit(reservation_id, usage, rates)
 
-    def _commit(self, reservation_id: str, usage: TokenUsage, rates: ModelRates) -> CommitResult:
-        cost = token_cost_gbp(
-            rates, usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
-        )
+    def _commit(
+        self,
+        reservation_id: str,
+        usage: TokenUsage,
+        rates: ModelRates | None = None,
+    ) -> CommitResult:
         with self._transaction() as db:
             row = db.execute(
-                "SELECT session_id FROM reservations WHERE id = ?", (reservation_id,)
+                "SELECT session_id, client_id, amount_gbp, input_cost_per_1m_usd, "
+                "output_cost_per_1m_usd, usd_to_gbp FROM reservations WHERE id = ?",
+                (reservation_id,),
             ).fetchone()
             if row is None:
                 raise KeyError("unknown or already settled reservation")
-            session_id = row[0]
+
+            session_id, client_id, amount_gbp, in_usd, out_usd, usd_gbp = row
+
+            if rates is not None:
+                cost = token_cost_gbp(
+                    rates, usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
+                )
+            elif in_usd > 0 or out_usd > 0:
+                stored_rates = ModelRates(
+                    provider="",
+                    model="",
+                    input_cost_per_1m_usd=in_usd,
+                    output_cost_per_1m_usd=out_usd,
+                    usd_to_gbp=usd_gbp,
+                )
+                cost = token_cost_gbp(
+                    stored_rates, usage.prompt_tokens, usage.candidates_tokens + usage.thoughts_tokens
+                )
+            else:
+                # Pre-v2 reservation: charge amount_gbp
+                cost = amount_gbp
+
+            now = time.time()
             db.execute(
-                "INSERT INTO usage (session_id, prompt_tokens, candidates_tokens,"
-                " thoughts_tokens, cost_gbp) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO usage (session_id, client_id, prompt_tokens, candidates_tokens, "
+                "thoughts_tokens, cost_gbp, cleared, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
                 (
                     session_id,
+                    client_id,
                     usage.prompt_tokens,
                     usage.candidates_tokens,
                     usage.thoughts_tokens,
                     cost,
+                    now,
                 ),
             )
             db.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
@@ -224,19 +356,179 @@ class SessionBudgetTracker:
             db.execute("DELETE FROM session_caps WHERE session_id = ?", (session_id,))
             return self._status(db, session_id)
 
-    def record(self, entry: LedgerEntry) -> None:
-        with self._transaction() as db:
-            db.execute("INSERT INTO entries (entry) VALUES (?)", (entry.model_dump_json(),))
+    def reset_client(self, client_id: str) -> None:
+        """Clear client's spend, summary rows and session caps; keep live reservations.
 
-    def recent_entries(self, limit: int = 50) -> list[LedgerEntry]:
-        """Oldest first."""
+        Never alters global spend.
+        """
+        with self._transaction() as db:
+            db.execute("UPDATE usage SET cleared = 1 WHERE client_id = ?", (client_id,))
+            db.execute(
+                "DELETE FROM session_caps WHERE session_id LIKE ? OR session_id = ?",
+                (f"{client_id}:%", client_id),
+            )
+
+    def record(self, entry: LedgerEntry) -> None:
+        client_id, _ = split_session_key(entry.session_id)
+        created_at = entry.time.timestamp()
+        with self._transaction() as db:
+            db.execute(
+                "INSERT INTO entries (entry, created_at, client_id) VALUES (?, ?, ?)",
+                (entry.model_dump_json(), created_at, client_id),
+            )
+
+    def recent_entries(self, limit: int = 50, client_id: str | None = None) -> list[LedgerEntry]:
+        """Oldest first. If client_id is given, returns only that client's entries."""
         if limit <= 0:
             return []
         with self._transaction("DEFERRED") as db:
-            rows = db.execute(
-                "SELECT entry FROM entries ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if client_id is None:
+                rows = db.execute(
+                    "SELECT entry FROM entries ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT entry FROM entries WHERE client_id = ? ORDER BY id DESC LIMIT ?",
+                    (client_id, limit),
+                ).fetchall()
         return [LedgerEntry.model_validate_json(row[0]) for row in reversed(rows)]
+
+    def apply_retention(self, retention_days: int) -> RetentionStats:
+        conn = self._connect()
+        try:
+            return apply_retention(conn, retention_days)
+        finally:
+            connection = conn
+            connection.close()
+
+    def backup(self, dest_backup_path: Path | str) -> Path:
+        return backup_database(self._path, dest_backup_path)
+
+    # Async forms running on dedicated ThreadPoolExecutor (max_workers=8)
+
+    async def areserve(
+        self,
+        session_id: str,
+        estimate_gbp: float,
+        *,
+        rates: ModelRates | None = None,
+        ttl_sec: float | None = None,
+    ) -> str | None:
+        """Shielded reserve. On cancellation before return, worker releases hold."""
+        loop = asyncio.get_running_loop()
+
+        def _do_reserve():
+            try:
+                return self.reserve(session_id, estimate_gbp, rates=rates, ttl_sec=ttl_sec)
+            except TypeError:
+                return self.reserve(session_id, estimate_gbp)
+
+        fut = loop.run_in_executor(self._executor, _do_reserve)
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            while not fut.done():
+                try:
+                    await asyncio.sleep(0.002)
+                except asyncio.CancelledError:
+                    pass
+            try:
+                res_id = fut.result()
+            except Exception:
+                raise
+            if res_id is not None:
+                rel_fut = loop.run_in_executor(self._executor, self.release, res_id)
+                while not rel_fut.done():
+                    try:
+                        await asyncio.sleep(0.002)
+                    except asyncio.CancelledError:
+                        pass
+            raise
+
+    async def acommit(
+        self,
+        reservation_id: str,
+        usage: TokenUsage,
+        rates: ModelRates | None = None,
+    ) -> CommitResult:
+        """Shielded commit. If cancelled while awaiting, raises CommitCancelled(CommitResult)."""
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(
+            self._executor,
+            lambda: self.commit(reservation_id, usage, rates=rates),
+        )
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            while not fut.done():
+                try:
+                    await asyncio.sleep(0.002)
+                except asyncio.CancelledError:
+                    pass
+            result = fut.result()
+            raise CommitCancelled(result)
+
+    async def arelease(self, reservation_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._executor, self.release, reservation_id)
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            while not fut.done():
+                try:
+                    await asyncio.sleep(0.002)
+                except asyncio.CancelledError:
+                    pass
+            fut.result()
+            raise
+
+    async def acheck_budget(self, session_id: str) -> BudgetStatus:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.check_budget, session_id)
+
+    async def aset_session_cap(self, session_id: str, cap_gbp: float) -> BudgetStatus:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, self.set_session_cap, session_id, cap_gbp
+        )
+
+    async def areset(self, session_id: str) -> BudgetStatus:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.reset, session_id)
+
+    async def areset_client(self, client_id: str) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.reset_client, client_id)
+
+    async def arecord(self, entry: LedgerEntry) -> None:
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._executor, self.record, entry)
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            while not fut.done():
+                try:
+                    await asyncio.sleep(0.002)
+                except asyncio.CancelledError:
+                    pass
+            fut.result()
+            raise
+
+    async def arecent_entries(
+        self, limit: int = 50, client_id: str | None = None
+    ) -> list[LedgerEntry]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, self.recent_entries, limit, client_id
+        )
+
+    async def aapply_retention(self, retention_days: int) -> RetentionStats:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.apply_retention, retention_days)
+
+    async def abackup(self, dest_backup_path: Path | str) -> Path:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.backup, dest_backup_path)
 
 
 _tracker: SessionBudgetTracker | None = None

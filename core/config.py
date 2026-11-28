@@ -50,6 +50,8 @@ class Settings:
     budget_reserve_input_tokens: int
     preset3_session_cap_gbp: float
     preset3_max_steps: int
+    ledger_retention_days: int = 0
+    client_budget_cap_gbp: float = 0.10
 
     def rates_for(self, model: ModelSettings) -> ModelRates:
         """What prices a call to model. Capture it once, before reserving."""
@@ -200,6 +202,8 @@ def get_settings() -> Settings:
         budget_reserve_input_tokens=_number("BUDGET_RESERVE_INPUT_TOKENS", 610, int),
         preset3_session_cap_gbp=_number("PRESET3_SESSION_CAP_GBP", 0.0017, allow_zero=True),
         preset3_max_steps=_number("PRESET3_MAX_STEPS", 6, int),
+        ledger_retention_days=_number("LEDGER_RETENTION_DAYS", 0, int, allow_zero=True),
+        client_budget_cap_gbp=_number("CLIENT_BUDGET_CAP_GBP", 0.10, allow_zero=True),
     )
 
 

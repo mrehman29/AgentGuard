@@ -59,6 +59,12 @@ class FakeTracker:
             global_spent_gbp=0, global_cap_gbp=1, is_exceeded=False,
         )
 
+    async def arecord(self, entry):
+        self.record(entry)
+
+    async def acheck_budget(self, session_id):
+        return self.check_budget(session_id)
+
 
 class RecordingProvider(SandboxProvider):
     provider_name = "docker"
@@ -272,10 +278,19 @@ async def test_source_and_events_pass_through(env):
         (guard_core.evaluate_owasp_policy, "tool_name args session_id"),
         (guard_core.evaluate_action, "tool_name args session_id source label on_event record"),
         (pipeline.execute_guarded, "intent tool_name args session_id provider source label on_event"),
-        (budget_store.SessionBudgetTracker.reserve, "self session_id estimate_gbp"),
+        (budget_store.SessionBudgetTracker.reserve, "self session_id estimate_gbp rates ttl_sec"),
         (budget_store.SessionBudgetTracker.commit, "self reservation_id usage rates"),
         (budget_store.SessionBudgetTracker.set_session_cap, "self session_id cap_gbp"),
-        (budget_store.SessionBudgetTracker.recent_entries, "self limit"),
+        (budget_store.SessionBudgetTracker.recent_entries, "self limit client_id"),
+        (budget_store.SessionBudgetTracker.areserve, "self session_id estimate_gbp rates ttl_sec"),
+        (budget_store.SessionBudgetTracker.acommit, "self reservation_id usage rates"),
+        (budget_store.SessionBudgetTracker.arelease, "self reservation_id"),
+        (budget_store.SessionBudgetTracker.acheck_budget, "self session_id"),
+        (budget_store.SessionBudgetTracker.aset_session_cap, "self session_id cap_gbp"),
+        (budget_store.SessionBudgetTracker.areset, "self session_id"),
+        (budget_store.SessionBudgetTracker.areset_client, "self client_id"),
+        (budget_store.SessionBudgetTracker.arecord, "self entry"),
+        (budget_store.SessionBudgetTracker.arecent_entries, "self limit client_id"),
     ],
 )
 def test_frozen_signatures(function, parameters):

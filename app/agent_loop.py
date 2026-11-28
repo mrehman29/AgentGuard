@@ -17,6 +17,7 @@ from core.config import Settings, get_settings, token_cost_gbp
 from core.pipeline import execute_guarded
 from core.providers import ModelError, ToolSpec, get_provider
 from core.schemas import (
+    CommitCancelled,
     Decision,
     GuardEvaluation,
     LedgerEntry,
@@ -100,7 +101,7 @@ async def _run_loop_workflow(
 ) -> None:
     """Preset 3 runaway loop in a unique loop session."""
     active_session = f"loop-{uuid.uuid4().hex[:6]}"
-    tracker.set_session_cap(active_session, settings.preset3_session_cap_gbp)
+    await tracker.aset_session_cap(active_session, settings.preset3_session_cap_gbp)
     total_steps = settings.preset3_max_steps
 
     await queue.put(
@@ -169,7 +170,7 @@ async def _run_loop_workflow(
         RunEvent(
             type="run_finished",
             run_id=run_id,
-            budget=tracker.check_budget(active_session),
+            budget=await tracker.acheck_budget(active_session),
         )
     )
 
@@ -188,7 +189,7 @@ async def _run_standard_workflow(
     """Standard run workflow (presets safe, injection, or custom)."""
     active_session = session_id or "demo"
     if budget_cap_gbp is not None:
-        tracker.set_session_cap(active_session, budget_cap_gbp)
+        await tracker.aset_session_cap(active_session, budget_cap_gbp)
 
     total_steps = 1
     await queue.put(
@@ -239,7 +240,7 @@ async def _run_standard_workflow(
         logger.exception("Prompt screen guard evaluation failed")
         guard = error_block("Guard error. Failing closed.", latency_ms=0)
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="web",
@@ -258,7 +259,7 @@ async def _run_standard_workflow(
         tool_args=prompt_args,
         guard=guard,
         sandbox=None,
-        budget=tracker.check_budget(active_session),
+        budget=await tracker.acheck_budget(active_session),
     )
     await queue.put(
         RunEvent(
@@ -275,20 +276,23 @@ async def _run_standard_workflow(
             RunEvent(
                 type="run_finished",
                 run_id=run_id,
-                budget=tracker.check_budget(active_session),
+                budget=await tracker.acheck_budget(active_session),
             )
         )
         return
 
     # Agent model turn
-    budget_before = tracker.check_budget(active_session)
+    budget_before = await tracker.acheck_budget(active_session)
     rates = settings.rates_for(settings.agent)
     estimated_input_tokens = max(
         len(prompt.encode("utf-8", "replace")) // 4 + 100,
         settings.budget_reserve_input_tokens,
     )
     reserve_cost = token_cost_gbp(rates, estimated_input_tokens, settings.agent.max_output_tokens)
-    reservation_id = tracker.reserve(active_session, reserve_cost)
+    ttl_sec = budget_store.RESERVATION_TTL_TIMEOUTS * settings.agent.timeout_sec
+    reservation_id = await tracker.areserve(
+        active_session, reserve_cost, rates=rates, ttl_sec=ttl_sec
+    )
 
     if reservation_id is None:
         # Refused reservation -> check if already exceeded (gates=[]) or would exceed (gates=[REGEX])
@@ -301,7 +305,7 @@ async def _run_standard_workflow(
         )
 
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="web",
@@ -330,7 +334,7 @@ async def _run_standard_workflow(
             tool_args={},
             guard=refused_guard,
             sandbox=None,
-            budget=tracker.check_budget(active_session),
+            budget=await tracker.acheck_budget(active_session),
         )
         await queue.put(
             RunEvent(
@@ -344,7 +348,7 @@ async def _run_standard_workflow(
             RunEvent(
                 type="run_finished",
                 run_id=run_id,
-                budget=tracker.check_budget(active_session),
+                budget=await tracker.acheck_budget(active_session),
             )
         )
         return
@@ -353,11 +357,11 @@ async def _run_standard_workflow(
     committed = False
     try:
         usage, text_reply, tool_call = await model_caller(prompt, settings)
-        commit_res = tracker.commit(reservation_id, usage, rates)
+        commit_res = await tracker.acommit(reservation_id, usage, rates=rates)
         committed = True
         # Charged either way: unusable output still costs.
         unusable = not tool_call and not (text_reply or "").strip()
-        tracker.record(
+        await tracker.arecord(
             LedgerEntry(
                 time=datetime.now(UTC),
                 source="web",
@@ -367,6 +371,22 @@ async def _run_standard_workflow(
                 cost_gbp=commit_res.cost_gbp,
             )
         )
+    except CommitCancelled as exc:
+        committed = True
+        try:
+            await tracker.arecord(
+                LedgerEntry(
+                    time=datetime.now(UTC),
+                    source="web",
+                    session_id=active_session,
+                    label="agent turn",
+                    outcome="ERROR",
+                    cost_gbp=exc.result.cost_gbp,
+                )
+            )
+        except Exception:
+            pass
+        raise
     except BaseException as exc:
         # Safe to log: a ModelError holds no message, and only types otherwise.
         if isinstance(exc, ModelError):
@@ -377,11 +397,11 @@ async def _run_standard_workflow(
             logger.warning("agent turn failed: %s", type(exc).__name__)
         if not committed:
             try:
-                tracker.release(reservation_id)
+                await tracker.arelease(reservation_id)
             except Exception:
                 pass
             try:
-                tracker.record(
+                await tracker.arecord(
                     LedgerEntry(
                         time=datetime.now(UTC),
                         source="web",
@@ -427,7 +447,7 @@ async def _run_standard_workflow(
             RunEvent(
                 type="run_finished",
                 run_id=run_id,
-                budget=tracker.check_budget(active_session),
+                budget=await tracker.acheck_budget(active_session),
             )
         )
         return
@@ -483,7 +503,7 @@ async def _run_standard_workflow(
         RunEvent(
             type="run_finished",
             run_id=run_id,
-            budget=tracker.check_budget(active_session),
+            budget=await tracker.acheck_budget(active_session),
         )
     )
 
