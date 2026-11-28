@@ -1082,9 +1082,9 @@ async def test_allowed_action_is_charged_at_classifier_rates(
     estimates = []
     reserve = tracker.reserve
 
-    def spy(session_id, estimate):
+    def spy(session_id, estimate, **kwargs):
         estimates.append(estimate)
-        return reserve(session_id, estimate)
+        return reserve(session_id, estimate, **kwargs)
 
     monkeypatch.setattr(tracker, "reserve", spy)
     result = await run_guarded()
@@ -1161,9 +1161,9 @@ async def test_agent_is_reserved_and_charged_at_its_own_rates(rates, server, mon
     estimates = []
     reserve = tracker.reserve
 
-    def spy(session_id, estimate):
+    def spy(session_id, estimate, **kwargs):
         estimates.append(estimate)
-        return reserve(session_id, estimate)
+        return reserve(session_id, estimate, **kwargs)
 
     monkeypatch.setattr(tracker, "reserve", spy)
     await run_agent(monkeypatch)
@@ -1353,10 +1353,22 @@ async def test_reservation_that_cannot_be_released_expires(
     assert reserved() == 0
 
 
-def test_reservations_outlive_the_longer_timeout(monkeypatch):
+async def test_each_reservation_outlives_its_own_models_timeout(rates, server, monkeypatch):
+    set_role(monkeypatch, "CLASSIFIER", timeout_sec=7)
     set_role(monkeypatch, "AGENT", timeout_sec=100)
     tracker = budget_store.get_tracker()
-    tracker.reserve("demo", 0.001)
-    later = time.time() + 100 * budget_store.RESERVATION_TTL_TIMEOUTS - 5
-    monkeypatch.setattr(budget_store.time, "time", lambda: later)
-    assert reserved() > 0
+    lifetimes = []
+    reserve = tracker.reserve
+
+    def spy(session_id, estimate, **kwargs):
+        lifetimes.append(kwargs["ttl_sec"])
+        return reserve(session_id, estimate, **kwargs)
+
+    monkeypatch.setattr(tracker, "reserve", spy)
+    server.body = rates.reply(text=VERDICT)
+    await run_guarded()
+    allow_every_action(monkeypatch)
+    server.body = rates.reply(text="hello")
+    await run_agent(monkeypatch)
+    factor = budget_store.RESERVATION_TTL_TIMEOUTS
+    assert lifetimes == [7 * factor, 100 * factor]

@@ -3,6 +3,7 @@
 Change only through the coordinator.
 """
 
+import asyncio
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -95,11 +96,23 @@ class BudgetStatus(Frozen):
     global_spent_gbp: float
     global_cap_gbp: float
     is_exceeded: bool
+    client_id: str | None = None
+    client_spent_gbp: float | None = None
+    client_reserved_gbp: float | None = None
+    client_cap_gbp: float | None = None
 
 
 class CommitResult(Frozen):
     cost_gbp: float = Field(ge=0)
     budget: BudgetStatus
+
+
+class CommitCancelled(asyncio.CancelledError):
+    """Raised when a commit operation was cancelled after acquiring the commit result."""
+
+    def __init__(self, result: CommitResult, *args: object) -> None:
+        super().__init__(*args)
+        self.result = result
 
 
 class SandboxRequest(Frozen):

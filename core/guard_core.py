@@ -19,6 +19,7 @@ from core.providers import ModelError, ModelReply, get_provider
 from core.schemas import (
     MAX_CODE_CHARS,
     BudgetStatus,
+    CommitCancelled,
     Decision,
     GuardEvaluation,
     LedgerEntry,
@@ -325,8 +326,8 @@ def _budget_block(reason: str, gates_passed: list[Stage], start: float) -> Guard
     )
 
 
-def _record(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
-    budget_store.get_tracker().record(
+async def _arecord(session_id: str, source: Source, label: str, guard: GuardEvaluation) -> None:
+    await budget_store.get_tracker().arecord(
         LedgerEntry(
             time=datetime.now(UTC),
             source=source,
@@ -366,20 +367,30 @@ async def _classify(
         input_tokens = settings.budget_reserve_input_tokens + len(payload.encode())
         estimate = token_cost_gbp(rates, input_tokens, model.max_output_tokens)
         tracker = budget_store.get_tracker()
-        reservation = tracker.reserve(session_id, estimate)
+        ttl_sec = budget_store.RESERVATION_TTL_TIMEOUTS * model.timeout_sec
+        reservation = await tracker.areserve(session_id, estimate, rates=rates, ttl_sec=ttl_sec)
         if reservation is None:
             return _budget_block(
                 "Budget cap: this call could exceed it, so it was not made.", [Stage.REGEX], start
             )
         if on_event is not None:
-            on_event("budget_reserved", tracker.check_budget(session_id))
+            on_event("budget_reserved", await tracker.acheck_budget(session_id))
 
         # Not wait_for: on Python 3.11 it can swallow a cancel.
         async with asyncio.timeout(model.timeout_sec):
             reply = await get_provider(model).classify(SYSTEM_INSTRUCTION, payload, OwaspVerdict)
+
         # Charge for the call before judging its output: bad output still costs.
-        cost = tracker.commit(reservation, reply.usage, rates).cost_gbp
-        reservation = None
+        # Commit outside timeout so Python 3.11 timeout does not convert CommitCancelled
+        try:
+            commit_res = await tracker.acommit(reservation, reply.usage)
+            cost = commit_res.cost_gbp
+            reservation = None
+        except CommitCancelled as exc:
+            cost = exc.result.cost_gbp
+            reservation = None
+            raise
+
         verdict = _parse_verdict(reply)
         if verdict.decision is Decision.ALLOW:
             passed.append(Stage.OWASP_LLM)
@@ -396,15 +407,17 @@ async def _classify(
     except ModelError as exc:
         logger.warning("classifier failed: %s", exc)
         return fail(f"Guard error: classifier failed ({exc.kind}).")
+    except CommitCancelled:
+        raise
     except Exception as exc:
         # The type only: messages can echo arguments or request details.
         logger.warning("classifier failed: %s", type(exc).__name__)
         return fail(f"Guard error: classifier failed ({type(exc).__name__}).")
     finally:
         # Also runs on cancellation, so no reservation is left behind.
-        if reservation is not None:
+        if reservation is not None and tracker is not None:
             try:
-                tracker.release(reservation)
+                await tracker.arelease(reservation)
             except Exception:
                 logger.exception("could not release a reservation; it will expire")
 
@@ -427,7 +440,7 @@ async def evaluate_action(
     start = time.perf_counter()
     passed: list[Stage] = []
     try:
-        status: BudgetStatus = budget_store.get_tracker().check_budget(session_id)
+        status: BudgetStatus = await budget_store.get_tracker().acheck_budget(session_id)
         if status.is_exceeded:
             guard = _budget_block("Budget cap reached.", [], start)
         else:
@@ -436,12 +449,22 @@ async def evaluate_action(
             if guard is None:
                 passed.append(Stage.REGEX)
                 guard = await _classify(tool_name, args, session_id, on_event)
+    except CommitCancelled as exc:
+        if record:
+            cancelled = error_block(
+                "Guard error: cancelled.", passed, _elapsed_ms(start), exc.result.cost_gbp
+            )
+            try:
+                await _arecord(session_id, source, label, cancelled)
+            except Exception:
+                logger.exception("ledger update failed")
+        raise
     except asyncio.CancelledError:
         # With record=False the caller records it.
         if record:
             cancelled = error_block("Guard error: cancelled.", passed, _elapsed_ms(start))
             try:
-                _record(session_id, source, label, cancelled)
+                await _arecord(session_id, source, label, cancelled)
             except Exception:
                 logger.exception("ledger update failed")
         raise
@@ -452,7 +475,7 @@ async def evaluate_action(
         )
     if record:
         try:
-            _record(session_id, source, label, guard)
+            await _arecord(session_id, source, label, guard)
         except Exception:
             logger.exception("ledger update failed")
             guard = error_block(

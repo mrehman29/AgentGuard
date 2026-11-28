@@ -194,6 +194,32 @@ Without a key, presets 1 and 3 show a classifier error `BLOCK` and nothing runs.
 
 In live runs, after about a dozen calls within seconds the API returned `429 RESOURCE_EXHAUSTED` and the guard blocked (fail closed). Use a billing-enabled key, or pause between demo runs.
 
+## Storage Management
+
+AgentGuard stores budget reservations, token usage, and audit logs in SQLite (`SQLITE_DB_PATH`, defaulting to `data/guard_state.db`).
+
+The storage management CLI (`python -m core.storage`) handles migrations, backups, retention pruning, and restores:
+
+```bash
+# Migrate database to schema v2 (runs automatically on startup)
+.venv/bin/python -m core.storage migrate
+
+# Prune old audit entries and rollup usage older than retention window (default: off)
+.venv/bin/python -m core.storage prune --days 30
+
+# Hot online backup to a destination file (mode 0600)
+.venv/bin/python -m core.storage backup data/guard_state.db data/backups/guard_state.bak
+
+# Restore database from backup (stop every process using it; creates .pre-restore.bak)
+.venv/bin/python -m core.storage restore data/backups/guard_state.bak data/guard_state.db --force
+```
+
+Stop old server processes before the first start of a new version. `migrate` and `prune` refuse a path that is not an existing ledger. Only an administrator should reset budgets: a session reset also lowers its client's spend.
+
+For retention policy and server database scale analysis, see:
+- [Backup and Restore Guide](docs/backup_and_restore.md)
+- [Server Database Architecture Decision](docs/server_database_decision.md)
+
 ## Live measurements
 
 Measured on 2026-11-27 with `gemini-3.5-flash-lite`:

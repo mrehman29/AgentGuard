@@ -99,7 +99,7 @@ async def guard_check_action(
             raise ValueError("args_json must be a JSON object")
     except Exception as exc:
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -107,7 +107,7 @@ async def guard_check_action(
                     label="check",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
-                )
+                ),
             )
         except Exception:
             pass
@@ -126,7 +126,7 @@ async def guard_check_action(
     except Exception as exc:
         logger.exception("MCP guard_check_action failed")
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -134,7 +134,7 @@ async def guard_check_action(
                     label="check",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
-                )
+                ),
             )
         except Exception:
             pass
@@ -159,7 +159,7 @@ async def guard_execute_sandbox(
             provider = _validate_arg_str(provider, "provider", max_len=32)
     except Exception as exc:
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -167,7 +167,7 @@ async def guard_execute_sandbox(
                     label="execute",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
-                )
+                ),
             )
         except Exception:
             pass
@@ -200,7 +200,7 @@ async def guard_get_budget_status(session_id: str = "default") -> dict[str, Any]
 
     if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
         try:
-            tracker.record(
+            await tracker.arecord(
                 LedgerEntry(
                     time=datetime.now(UTC),
                     source="mcp",
@@ -208,14 +208,14 @@ async def guard_get_budget_status(session_id: str = "default") -> dict[str, Any]
                     label="budget",
                     outcome="BLOCK error",
                     cost_gbp=0.0,
-                )
+                ),
             )
         except Exception:
             pass
         return {"error": "Invalid session_id", "session_id": "invalid"}
 
     try:
-        status = tracker.check_budget(session_id)
+        status = await tracker.acheck_budget(session_id)
         return status.model_dump()
     except Exception:
         logger.exception("MCP check_budget failed")

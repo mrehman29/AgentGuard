@@ -50,8 +50,12 @@ def rates():
     return settings.rates_for(settings.classifier)
 
 
+def hold(tracker, session_id, amount):
+    return tracker.reserve(session_id, amount, rates=rates(), ttl_sec=60.0)
+
+
 def spend(tracker, session_id="demo", usage=USAGE):
-    return tracker.commit(tracker.reserve(session_id, 0.001), usage, rates())
+    return tracker.commit(hold(tracker, session_id, 0.001), usage)
 
 
 def entry(label="screen", cost=0.0):
@@ -77,19 +81,19 @@ def test_commit_charges_thoughts_as_output(tracker):
 
 
 def test_commit_uses_the_reservations_session(tracker):
-    first = tracker.reserve("a", 0.001)
-    tracker.reserve("b", 0.001)
-    assert tracker.commit(first, USAGE, rates()).budget.session_id == "a"
+    first = hold(tracker, "a", 0.001)
+    hold(tracker, "b", 0.001)
+    assert tracker.commit(first, USAGE).budget.session_id == "a"
     assert tracker.check_budget("a").spent_gbp > 0
     assert tracker.check_budget("b").spent_gbp == 0
 
 
 def test_reservation_is_settled_once(tracker):
-    reservation = tracker.reserve("demo", 0.001)
+    reservation = hold(tracker, "demo", 0.001)
     assert tracker.check_budget("demo").reserved_gbp == pytest.approx(0.001)
-    tracker.commit(reservation, USAGE, rates())
+    tracker.commit(reservation, USAGE)
     with pytest.raises(KeyError):
-        tracker.commit(reservation, USAGE, rates())
+        tracker.commit(reservation, USAGE)
     tracker.release(reservation)
     assert tracker.check_budget("demo").spent_gbp == pytest.approx(
         token_cost_gbp(rates(), 400, 80)
@@ -98,20 +102,20 @@ def test_reservation_is_settled_once(tracker):
 
 def test_release_frees_the_headroom(tracker):
     tracker.set_session_cap("demo", 0.001)
-    first = tracker.reserve("demo", 0.001)
-    assert tracker.reserve("demo", 0.0001) is None
+    first = hold(tracker, "demo", 0.001)
+    assert hold(tracker, "demo", 0.0001) is None
     tracker.release(first)
-    assert tracker.reserve("demo", 0.001) is not None
+    assert hold(tracker, "demo", 0.001) is not None
 
 
 def test_abandoned_reservation_expires(tracker, monkeypatch):
     tracker.set_session_cap("demo", 0.001)
-    reservation = tracker.reserve("demo", 0.001)
-    later = budget_store.time.time() + 5 * budget_store.RESERVATION_TTL_TIMEOUTS + 1
+    reservation = hold(tracker, "demo", 0.001)
+    later = budget_store.time.time() + 61
     monkeypatch.setattr(budget_store.time, "time", lambda: later)
     assert tracker.check_budget("demo").reserved_gbp == 0
-    assert tracker.reserve("demo", 0.001) is not None
-    assert tracker.commit(reservation, USAGE, rates()).cost_gbp > 0  # a late call is still charged
+    assert hold(tracker, "demo", 0.001) is not None
+    assert tracker.commit(reservation, USAGE).cost_gbp > 0  # a late call is still charged
 
 
 def test_cap_can_only_be_lowered(tracker):
@@ -123,37 +127,37 @@ def test_cap_can_only_be_lowered(tracker):
         with pytest.raises(ValueError):
             tracker.set_session_cap("demo", bad)
         with pytest.raises(ValueError):
-            tracker.reserve("demo", bad)
+            hold(tracker, "demo", bad)
 
 
 def test_is_exceeded_only_when_spent_reaches_a_cap(tracker):
-    tracker.reserve("demo", 0.05)
+    hold(tracker, "demo", 0.05)
     assert tracker.check_budget("demo").is_exceeded is False
     tracker.set_session_cap("zero", 0)
     assert tracker.check_budget("zero").is_exceeded is True
-    assert tracker.reserve("zero", 0) is None
+    assert hold(tracker, "zero", 0) is None
 
 
 def test_reset_clears_one_session_and_keeps_global(tracker):
     cost = spend(tracker, "demo").cost_gbp
     spend(tracker, "loop-1")
     tracker.set_session_cap("demo", 0.01)
-    pending = tracker.reserve("demo", 0.001)
+    pending = hold(tracker, "demo", 0.001)
     status = tracker.reset("demo")
     assert (status.spent_gbp, status.total_tokens, status.cap_gbp) == (0, 0, 0.05)
     assert status.reserved_gbp == pytest.approx(0.001)
     assert status.global_spent_gbp == pytest.approx(2 * cost)
     assert tracker.check_budget("loop-1").spent_gbp == pytest.approx(cost)
-    assert tracker.commit(pending, USAGE, rates()).budget.spent_gbp == pytest.approx(cost)
+    assert tracker.commit(pending, USAGE).budget.spent_gbp == pytest.approx(cost)
 
 
 def test_new_session_cannot_pass_the_global_cap(tracker, monkeypatch):
     monkeypatch.setenv("GLOBAL_BUDGET_CAP_GBP", "0.0025")
-    assert tracker.reserve("a", 0.001)
-    assert tracker.reserve("b", 0.001)
-    assert tracker.reserve("c", 0.001) is None
+    assert hold(tracker, "a", 0.001)
+    assert hold(tracker, "b", 0.001)
+    assert hold(tracker, "c", 0.001) is None
     tracker.reset("a")
-    assert tracker.reserve("d", 0.001) is None
+    assert hold(tracker, "d", 0.001) is None
 
 
 def test_entries_are_oldest_first_and_limited(tracker):
@@ -182,17 +186,17 @@ def _spend_many(count, results):
     tracker = budget_store.SessionBudgetTracker()
     committed = 0
     for _ in range(count):
-        reservation = tracker.reserve("shared", 0.001)
+        reservation = hold(tracker, "shared", 0.001)
         if reservation:
             usage = TokenUsage(prompt_tokens=100, candidates_tokens=10)
-            tracker.commit(reservation, usage, rates())
+            tracker.commit(reservation, usage)
             committed += 1
     results.put(committed)
 
 
 def _reserve_many(count, results):
     tracker = budget_store.SessionBudgetTracker()
-    results.put(sum(tracker.reserve("shared", 0.001) is not None for _ in range(count)))
+    results.put(sum(hold(tracker, "shared", 0.001) is not None for _ in range(count)))
 
 
 def _run_processes(target, processes, count):
@@ -224,7 +228,7 @@ def test_concurrent_processes_cannot_pass_the_cap(monkeypatch):
 
 async def test_concurrent_threads_cannot_pass_the_cap(tracker):
     tracker.set_session_cap("demo", 0.0055)
-    ids = await asyncio.gather(*(asyncio.to_thread(tracker.reserve, "demo", 0.001) for _ in range(30)))
+    ids = await asyncio.gather(*(asyncio.to_thread(hold, tracker, "demo", 0.001) for _ in range(30)))
     assert sum(i is not None for i in ids) == 5
 
 
